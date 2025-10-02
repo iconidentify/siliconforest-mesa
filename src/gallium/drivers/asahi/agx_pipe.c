@@ -1969,6 +1969,7 @@ agx_init_compute_caps(struct pipe_screen *pscreen)
 static void
 agx_init_screen_caps(struct pipe_screen *pscreen)
 {
+   struct agx_device *dev = agx_device(pscreen);
    struct pipe_caps *caps = (struct pipe_caps *)&pscreen->caps;
 
    u_init_pipe_screen_caps(pscreen, 1);
@@ -2005,7 +2006,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->texture_barrier = true;
 
    /* Timer resolution is the length of a single tick in nanos */
-   caps->timer_resolution = agx_gpu_timestamp_to_ns(agx_device(pscreen), 1);
+   caps->timer_resolution = agx_gpu_timestamp_to_ns(dev, 1);
 
    caps->shader_subgroup_size = 32;
    caps->shader_subgroup_supported_stages = BITFIELD_MASK(MESA_SHADER_STAGES);
@@ -2174,6 +2175,9 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->max_texture_anisotropy = 16.0;
 
    caps->max_texture_lod_bias = 16.0; /* arbitrary */
+
+   caps->min_vma = dev->main_heap_start;
+   caps->max_vma = dev->main_heap_start + dev->main_heap_size - 1;
 }
 
 static bool
@@ -2383,6 +2387,65 @@ agx_get_cl_cts_version(struct pipe_screen *pscreen)
    return NULL;
 }
 
+static struct pipe_vm_allocation *
+agx_alloc_vm(struct pipe_screen *pscreen, uint64_t start, uint64_t size)
+{
+   struct agx_device *dev = agx_device(pscreen);
+   struct pipe_vm_allocation *res = CALLOC_STRUCT(pipe_vm_allocation);
+   if (!res)
+      return NULL;
+
+   simple_mtx_lock(&dev->vma_lock);
+   bool err = util_vma_heap_alloc_addr(&dev->main_heap, start, size);
+   simple_mtx_unlock(&dev->vma_lock);
+   if (!err) {
+      FREE(res);
+      return NULL;
+   }
+
+   res->start = start;
+   res->size = size;
+
+   return res;
+}
+
+static void
+agx_free_vm(struct pipe_screen *pscreen, struct pipe_vm_allocation *alloc)
+{
+   struct agx_device *dev = agx_device(pscreen);
+   simple_mtx_lock(&dev->vma_lock);
+   util_vma_heap_free(&dev->main_heap, alloc->start, alloc->size);
+   simple_mtx_unlock(&dev->vma_lock);
+   FREE(alloc);
+}
+
+static bool
+agx_resource_assign_vma(struct pipe_screen *pscreen,
+                        struct pipe_resource *presource,
+                        uint64_t address)
+{
+   struct agx_resource *res = agx_resource(presource);
+   struct agx_device *dev = agx_device(pscreen);
+
+   if (res->bo->va) {
+      if (agx_bo_bind(dev, NULL, res->bo->va->addr, res->bo->va->size_B, 0, DRM_ASAHI_BIND_UNBIND))
+         return false;
+      FREE(res->bo->va);
+   }
+
+   if (address) {
+      res->bo->va = CALLOC_STRUCT(agx_va);
+      res->bo->va->addr = address;
+      res->bo->va->size_B = res->bo->size;
+      res->bo->va->flags = AGX_VA_FIXED;
+      if (agx_bo_bind(dev, res->bo, res->bo->va->addr, res->bo->va->size_B, 0, DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
+         return false;
+   } else {
+      res->bo->va = NULL;
+   }
+   return true;
+}
+
 struct pipe_screen *
 agx_screen_create(int fd, struct renderonly *ro,
                   const struct pipe_screen_config *config)
@@ -2444,6 +2507,9 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->fence_get_fd = agx_fence_get_fd;
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
    screen->get_cl_cts_version = agx_get_cl_cts_version;
+   screen->alloc_vm = agx_alloc_vm;
+   screen->free_vm = agx_free_vm;
+   screen->resource_assign_vma = agx_resource_assign_vma;
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->nir_options[i] = &agx_nir_options;

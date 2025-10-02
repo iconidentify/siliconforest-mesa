@@ -792,7 +792,7 @@ Rusticl Optional Core Features:
 
 Rusticl Optional OpenCL 2.x Features:
   Shared virtual memory                                 in progress
-  - Coarse Grain Buffer                                 DONE (iris, radeonsi, llvmpipe)
+  - Coarse Grain Buffer                                 DONE (asahi, iris, radeonsi, llvmpipe)
   - Fine Grain Buffer                                   in progress
   - System                                              DONE (nvc0, llvmpipe)
   - clEnqueueSVMMigrateMem                              DONE
