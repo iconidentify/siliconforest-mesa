@@ -206,19 +206,20 @@ impl Platform {
 
         // Allocate 1/8 of the available VM. No specific reason for this limit. Might have to bump
         // this later, but it's probably fine as there is plenty of VM available.
-        let size = NonZeroU64::new((end.get() / 8).next_power_of_two())?;
-        if start > size {
+        let size =
+            NonZeroU64::new(((end.get() - start.get()) / 8).next_multiple_of(alignment.into()))?;
+        if start.saturating_add(size.get()) >= end {
             return None;
         }
 
         let mut allocs = Vec::new();
         for dev in devs {
-            allocs.push(dev.screen().alloc_vm(size, size)?);
+            allocs.push(dev.screen().alloc_vm(start, size)?);
         }
 
         let alignment = cmp::max(alignment.into(), page_size);
         Some(PlatformVM {
-            vm: Mutex::new(VM::new(size, size)),
+            vm: Mutex::new(VM::new(start, size)),
             vm_alignment: NonZeroU64::new(alignment)?,
             _dev_allocs: allocs,
         })
