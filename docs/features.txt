@@ -881,7 +881,7 @@ Rusticl extensions:
   cl_khr_terminate_context                              not started
   cl_khr_throttle_hints                                 not started
   cl_khr_work_group_uniform_arithmetic                  not started
-  cl_ext_buffer_device_address                          DONE (iris, llvmpipe, radeonsi, zink)
+  cl_ext_buffer_device_address                          DONE (asahi, iris, llvmpipe, radeonsi, zink)
   cl_ext_cxx_for_opencl                                 not started
   cl_ext_device_fission                                 not started
   cl_ext_float_atomics                                  not started

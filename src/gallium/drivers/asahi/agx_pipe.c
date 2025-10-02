@@ -1136,6 +1136,7 @@ transition_resource(struct pipe_context *pctx, struct agx_resource *rsrc,
    struct agx_resource *new_res =
       agx_resource(pctx->screen->resource_create(pctx->screen, templ));
 
+   assert(!(rsrc->base.flags & PIPE_RESOURCE_FLAG_FIXED_ADDRESS));
    assert(new_res);
    assert(!(rsrc->base.bind & PIPE_BIND_SHARED) && "cannot swap BOs if shared");
 
@@ -2446,6 +2447,15 @@ agx_resource_assign_vma(struct pipe_screen *pscreen,
    return true;
 }
 
+static uint64_t
+agx_resource_get_address(struct pipe_screen *screen,
+                         struct pipe_resource *resource)
+{
+   assert(resource->flags & PIPE_RESOURCE_FLAG_FIXED_ADDRESS);
+   struct agx_resource *res = agx_resource(resource);
+   return res->bo->va->addr;
+}
+
 struct pipe_screen *
 agx_screen_create(int fd, struct renderonly *ro,
                   const struct pipe_screen_config *config)
@@ -2510,6 +2520,7 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->alloc_vm = agx_alloc_vm;
    screen->free_vm = agx_free_vm;
    screen->resource_assign_vma = agx_resource_assign_vma;
+   screen->resource_get_address = agx_resource_get_address;
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->nir_options[i] = &agx_nir_options;
