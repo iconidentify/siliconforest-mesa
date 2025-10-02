@@ -37,6 +37,10 @@ enum agx_bo_flags {
    /* BO is read-only from the GPU side
     */
    AGX_BO_READONLY = 1 << 5,
+
+   /* BO's VMA is externally managed
+    */
+   AGX_BO_NO_VMA = 1 << 6,
 };
 
 enum agx_va_flags {

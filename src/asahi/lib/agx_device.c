@@ -205,23 +205,25 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    bo->handle = bo->uapi_handle = handle;
    bo->prime_fd = -1;
 
-   enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
-   bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
-   if (!bo->va) {
-      fprintf(stderr, "Failed to allocate BO VMA\n");
-      agx_bo_free(dev, bo);
-      return NULL;
-   }
+   if (!(flags & AGX_BO_NO_VMA)) {
+      enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
+      bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
+      if (!bo->va) {
+         fprintf(stderr, "Failed to allocate BO VMA\n");
+         agx_bo_free(dev, bo);
+         return NULL;
+      }
 
-   uint32_t bind = DRM_ASAHI_BIND_READ;
-   if (!(flags & AGX_BO_READONLY)) {
-      bind |= DRM_ASAHI_BIND_WRITE;
-   }
+      uint32_t bind = DRM_ASAHI_BIND_READ;
+      if (!(flags & AGX_BO_READONLY)) {
+         bind |= DRM_ASAHI_BIND_WRITE;
+      }
 
-   ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
-   if (ret) {
-      agx_bo_free(dev, bo);
-      return NULL;
+      ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
+      if (ret) {
+         agx_bo_free(dev, bo);
+         return NULL;
+      }
    }
 
    return bo;

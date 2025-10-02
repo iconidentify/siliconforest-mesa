@@ -577,6 +577,9 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
    if (bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED))
       create_flags |= AGX_BO_SHAREABLE;
 
+   if (nresource->base.flags & PIPE_RESOURCE_FLAG_FRONTEND_VM)
+      create_flags |= AGX_BO_NO_VMA;
+
    nresource->bo =
       agx_bo_create(dev, nresource->layout.size_B, 0, create_flags, label);
 
