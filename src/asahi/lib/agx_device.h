@@ -118,6 +118,8 @@ struct agx_device {
    /* VMA heaps */
    simple_mtx_t vma_lock;
    uint64_t shader_base;
+   uint64_t main_heap_start;
+   uint64_t main_heap_size;
    struct util_vma_heap main_heap;
    struct util_vma_heap usc_heap;
    uint64_t guard_size;

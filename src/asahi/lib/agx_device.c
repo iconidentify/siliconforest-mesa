@@ -592,10 +592,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    uint64_t shader_size = 0x100000000ull;
    // Put the user heap after the USC heap
-   uint64_t user_start = dev->shader_base + shader_size;
+   dev->main_heap_start = dev->shader_base + shader_size;
 
    assert(dev->shader_base >= dev->params.vm_start);
-   assert(user_start < dev->params.vm_end);
+   assert(dev->main_heap_start < dev->params.vm_end);
 
    dev->agxdecode = agxdecode_new_context(dev->shader_base);
 
@@ -619,7 +619,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       .kernel_end = dev->params.vm_end,
    };
 
-   uint64_t user_size = vm_create.kernel_start - user_start;
+   uint64_t user_size = vm_create.kernel_start - dev->main_heap_start;
 
    int ret = asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
    if (ret) {
@@ -629,24 +629,25 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    /* Round the user VA window to powers-of-two... */
-   user_start = util_next_power_of_two64(user_start);
+   dev->main_heap_start = util_next_power_of_two64(dev->main_heap_start);
    user_size = util_next_power_of_two64(user_size + 1) >> 1;
 
    /* ...so when we cut user size in half to emulate sparse buffers... */
    user_size /= 2;
 
    /* ...or maybe in quarters if necessary to disambiguate */
-   if (user_size == user_start) {
+   if (user_size == dev->main_heap_start) {
       user_size /= 2;
    }
 
    /* ...we can distinguish the top/bottom half by an address bit */
    dev->sparse_ro_offset = user_size;
-   assert((user_start & dev->sparse_ro_offset) == 0);
-   assert(((user_start + (user_size - 1)) & dev->sparse_ro_offset) == 0);
+   assert((dev->main_heap_start & dev->sparse_ro_offset) == 0);
+   assert(((dev->main_heap_start + (user_size - 1)) & dev->sparse_ro_offset) == 0);
 
    simple_mtx_init(&dev->vma_lock, mtx_plain);
-   util_vma_heap_init(&dev->main_heap, user_start, user_size);
+   util_vma_heap_init(&dev->main_heap, dev->main_heap_start, user_size);
+   dev->main_heap_size = user_size;
    util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
 
    dev->vm_id = vm_create.vm_id;
