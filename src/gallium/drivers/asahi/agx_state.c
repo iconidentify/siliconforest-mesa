@@ -5444,6 +5444,12 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       }
    }
 
+   for (uint32_t i = 0; i < info->num_globals; i++) {
+      struct agx_resource *buffer = agx_resource(info->globals[i]);
+      agx_batch_writes(batch, buffer, 0);
+      batch->incoherent_writes = true;
+   }
+
    agx_launch(batch, grid, wg, cs, NULL, MESA_SHADER_COMPUTE,
               info->variable_shared_mem);
 
