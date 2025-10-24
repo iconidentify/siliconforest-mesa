@@ -294,7 +294,14 @@ impl Context {
         mut alignment: NonZeroU64,
     ) -> CLResult<*mut c_void> {
         // TODO: choose better alignment in regards to huge pages
-        alignment = cmp::max(alignment, NonZeroU64::new(0x1000).unwrap());
+        alignment = cmp::max(
+            alignment,
+            Platform::get()
+                .vm
+                .as_ref()
+                .map(|vm| vm.vm_alignment)
+                .unwrap_or(NonZeroU64::new(Platform::get().page_size).unwrap()),
+        );
 
         // clSVMAlloc will fail if alignment is not a power of two.
         // `from_size_align()` verifies this condition is met.

@@ -28,6 +28,7 @@ pub const MAX_PIXEL_SIZE_BYTES: u64 = 4 * 4;
 
 pub struct PlatformVM<'a> {
     vm: Mutex<VM>,
+    pub vm_alignment: NonZeroU64,
     // we make use of the drop to automatically free the reserved VM
     _dev_allocs: Vec<ScreenVMAllocation<'a>>,
 }
@@ -49,6 +50,7 @@ pub struct Platform {
     pub extensions: Vec<cl_name_version>,
     // lifetime has to match the one of devs
     pub vm: Option<PlatformVM<'static>>,
+    pub page_size: u64,
 }
 
 pub enum PerfDebugLevel {
@@ -86,6 +88,7 @@ static mut PLATFORM: Platform = Platform {
     extension_string: String::new(),
     extensions: Vec::new(),
     vm: None,
+    page_size: 0,
 };
 static mut PLATFORM_DBG: PlatformDebug = PlatformDebug {
     allow_invalid_spirv: false,
@@ -177,7 +180,7 @@ impl Platform {
         unsafe { &*addr_of!(PLATFORM_FEATURES) }
     }
 
-    fn alloc_vm(devs: &[Device]) -> Option<PlatformVM<'_>> {
+    fn alloc_vm(devs: &[Device], page_size: u64) -> Option<PlatformVM<'_>> {
         // We support buffer SVM only on 64 bit platforms
         if cfg!(not(target_pointer_width = "64")) {
             return None;
@@ -186,9 +189,20 @@ impl Platform {
         // No need to check system SVM devices
         let devs = devs.iter().filter(|dev| !dev.system_svm_supported());
 
-        let (start, end) = devs.clone().filter_map(|dev| dev.vm_alloc_range()).reduce(
-            |(min_a, max_a), (min_b, max_b)| (cmp::max(min_a, min_b), cmp::min(max_a, max_b)),
-        )?;
+        let (start, end, alignment) = devs
+            .clone()
+            .filter_map(|dev| {
+                let (min, max) = dev.vm_alloc_range()?;
+                let alignment = dev.vm_alignment();
+                Some((min, max, alignment))
+            })
+            .reduce(|(min_a, max_a, alignment_a), (min_b, max_b, alignment_b)| {
+                (
+                    cmp::max(min_a, min_b),
+                    cmp::min(max_a, max_b),
+                    cmp::max(alignment_a, alignment_b),
+                )
+            })?;
 
         // Allocate 1/8 of the available VM. No specific reason for this limit. Might have to bump
         // this later, but it's probably fine as there is plenty of VM available.
@@ -202,8 +216,10 @@ impl Platform {
             allocs.push(dev.screen().alloc_vm(size, size)?);
         }
 
+        let alignment = cmp::max(alignment.into(), page_size);
         Some(PlatformVM {
             vm: Mutex::new(VM::new(size, size)),
+            vm_alignment: NonZeroU64::new(alignment)?,
             _dev_allocs: allocs,
         })
     }
@@ -215,7 +231,13 @@ impl Platform {
 
         self.devs = Device::all();
 
-        self.vm = Self::alloc_vm(&self.devs);
+        unsafe {
+            os_get_page_size(&mut self.page_size);
+        }
+
+        if self.page_size != 0 {
+            self.vm = Self::alloc_vm(&self.devs, self.page_size);
+        }
 
         if self
             .devs

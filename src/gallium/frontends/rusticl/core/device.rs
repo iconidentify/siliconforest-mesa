@@ -1206,6 +1206,10 @@ impl DeviceBase {
         Some((NonZeroU64::new(min)?, NonZeroU64::new(max)?))
     }
 
+    pub fn vm_alignment(&self) -> u32 {
+        self.screen.caps().vma_alignment
+    }
+
     pub fn unified_memory(&self) -> bool {
         self.screen.caps().uma
     }
