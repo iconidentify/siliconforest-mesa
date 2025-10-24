@@ -187,6 +187,7 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
 
    caps->min_vma =
    caps->max_vma = 0;
+   caps->vma_alignment = 0x1000;
 }
 
 uint64_t u_default_get_timestamp(UNUSED struct pipe_screen *screen)

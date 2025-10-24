@@ -1131,6 +1131,7 @@ struct pipe_caps {
    /** for CL SVM */
    uint64_t min_vma;
    uint64_t max_vma;
+   uint32_t vma_alignment;
 
    enum pipe_vertex_input_alignment vertex_input_alignment;
    enum pipe_endian endianness;
