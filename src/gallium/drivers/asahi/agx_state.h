@@ -954,6 +954,17 @@ agx_resource_valid(struct agx_resource *rsrc, int level)
    return BITSET_TEST(rsrc->data_valid, level);
 }
 
+struct agx_memory_object {
+   struct pipe_memory_object b;
+   struct agx_bo *bo;
+};
+
+static inline struct agx_memory_object *
+agx_memory_object(struct pipe_memory_object *pmemobj)
+{
+   return (struct agx_memory_object *)pmemobj;
+}
+
 static inline void *
 agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z)
 {

@@ -645,6 +645,92 @@ agx_resource_destroy(struct pipe_screen *screen, struct pipe_resource *prsrc)
    FREE(rsrc);
 }
 
+static struct pipe_resource *
+agx_resource_from_memobj(struct pipe_screen *pscreen,
+                         const struct pipe_resource *tmpl,
+                         struct pipe_memory_object *pmemobj,
+                         ASSERTED uint64_t offset)
+{
+   struct agx_memory_object *memobj = agx_memory_object(pmemobj);
+   struct pipe_resource *prsc;
+
+   assert(memobj->bo);
+   assert(offset == 0);
+
+   /* We shouldn't get a scanout buffer here. */
+   assert(!(tmpl->bind & PIPE_BIND_SCANOUT));
+
+   /* Can't handle combined depth and stencil yet. */
+   if (util_format_is_depth_and_stencil(tmpl->format))
+      return NULL;
+
+   uint64_t modifiers[] = {
+      DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
+      DRM_FORMAT_MOD_APPLE_GPU_TILED,
+      DRM_FORMAT_MOD_LINEAR
+   };
+   int mod_cnt = ARRAY_SIZE(modifiers);
+
+   /* Allocate new pipe resource and attach the memobj's bo as backing. */
+   prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl, modifiers,
+                                                    mod_cnt, memobj->bo);
+
+   /* Retry without DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED modifier
+    * if we don't get a prsc first. There are a few scenarios where
+    * Vulkan hk will bail out of compression, that we can't know of,
+    * e.g., images created with flag VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+    *
+    * This results in resource creation failure, because the memobj->bo
+    * from hk is too small to contain the expected compression surface.
+    * Retrying without expecting a "compressed" bo may heal this.
+    */
+   if (!prsc) {
+      prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl,
+                                                       &modifiers[1],
+                                                       mod_cnt - 1,
+                                                       memobj->bo);
+   }
+
+   return prsc;
+}
+
+static struct pipe_memory_object *
+agx_memobj_create_from_handle(struct pipe_screen *pscreen,
+                              struct winsys_handle *whandle, bool dedicated)
+{
+   struct agx_device *dev = agx_device(pscreen);
+   struct agx_memory_object *memobj = CALLOC_STRUCT(agx_memory_object);
+   if (!memobj)
+      return NULL;
+
+   assert(whandle->type == WINSYS_HANDLE_TYPE_FD);
+   assert(whandle->modifier == DRM_FORMAT_MOD_INVALID);
+
+   struct agx_bo *bo = agx_bo_import(dev, whandle->handle);
+   if (!bo) {
+      free(memobj);
+      return NULL;
+   }
+
+   memobj->b.dedicated = dedicated;
+   memobj->bo = bo;
+
+   return &memobj->b;
+}
+
+static void
+agx_memobj_destroy(struct pipe_screen *pscreen,
+                   struct pipe_memory_object *pmemobj)
+{
+   struct agx_device *dev = agx_device(pscreen);
+   struct agx_memory_object *memobj = agx_memory_object(pmemobj);
+
+   assert(memobj->bo);
+   agx_bo_unreference(dev, memobj->bo);
+
+   free(pmemobj);
+}
+
 void
 agx_batch_track_image(struct agx_batch *batch, struct pipe_image_view *image)
 {
@@ -2081,6 +2167,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->indep_blend_enable = true;
    caps->indep_blend_func = true;
    caps->uma = true;
+   caps->memobj = true;
    caps->texture_float_linear = true;
    caps->texture_half_float_linear = true;
    caps->texture_mirror_clamp_to_edge = true;
@@ -2500,6 +2587,11 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->fence_get_fd = agx_fence_get_fd;
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
    screen->get_cl_cts_version = agx_get_cl_cts_version;
+
+   /* GL_EXT_memory_object */
+   screen->memobj_create_from_handle = agx_memobj_create_from_handle;
+   screen->memobj_destroy = agx_memobj_destroy;
+   screen->resource_from_memobj = agx_resource_from_memobj;
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->nir_options[i] = &agx_nir_options;
