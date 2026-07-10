@@ -494,9 +494,10 @@ agx_select_best_modifier(const struct agx_resource *pres)
 }
 
 static struct pipe_resource *
-agx_resource_create_with_modifiers(struct pipe_screen *screen,
-                                   const struct pipe_resource *templ,
-                                   const uint64_t *modifiers, int count)
+agx_resource_create_with_modifiers_opt_bo(struct pipe_screen *screen,
+                                          const struct pipe_resource *templ,
+                                          const uint64_t *modifiers, int count,
+                                          struct agx_bo *bo_attach)
 {
    struct agx_device *dev = agx_device(screen);
    struct agx_resource *nresource;
@@ -592,8 +593,15 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
    if (bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED))
       create_flags |= AGX_BO_SHAREABLE;
 
-   nresource->bo =
-      agx_bo_create(dev, nresource->layout.size_B, 0, create_flags, label);
+   if (!bo_attach) {
+      nresource->bo = agx_bo_create(dev, nresource->layout.size_B, 0, create_flags, label);
+
+     /* bo to attach provided. Validate minimum size and subset of flags, if ok attach. */
+   } else if ((bo_attach->size >= nresource->layout.size_B) &&
+              ((bo_attach->flags & create_flags) == create_flags)) {
+      nresource->bo = bo_attach;
+      agx_bo_reference(nresource->bo);
+   }
 
    if (!nresource->bo) {
       FREE(nresource);
@@ -602,6 +610,14 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
 
    agx_resource_debug(nresource, "New: ");
    return &nresource->base;
+}
+
+static struct pipe_resource *
+agx_resource_create_with_modifiers(struct pipe_screen *screen,
+                                   const struct pipe_resource *templ,
+                                   const uint64_t *modifiers, int count)
+{
+   return agx_resource_create_with_modifiers_opt_bo(screen, templ, modifiers, count, NULL);
 }
 
 static struct pipe_resource *
