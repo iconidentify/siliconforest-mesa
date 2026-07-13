@@ -1080,8 +1080,10 @@ hk_get_device_properties(const struct agx_device *dev,
    agx_get_device_uuid(dev, &dev_uuid);
    static_assert(sizeof(dev_uuid) == VK_UUID_SIZE);
    memcpy(properties->deviceUUID, &dev_uuid, VK_UUID_SIZE);
-   static_assert(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
-   memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
+   uint8_t driver_uuid[VK_UUID_SIZE];
+   agx_get_driver_uuid(&driver_uuid);
+   static_assert(sizeof(driver_uuid) >= VK_UUID_SIZE);
+   memcpy(properties->driverUUID, &driver_uuid, VK_UUID_SIZE);
 
    strncpy(properties->driverName, "Honeykrisp", VK_MAX_DRIVER_NAME_SIZE);
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
