@@ -133,6 +133,19 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
 }
 
 static void
+agx_resource_set_stencil(struct pipe_resource *prsrc,
+                         struct pipe_resource *stencil)
+{
+   agx_resource(prsrc)->separate_stencil = agx_resource(stencil);
+}
+
+static struct pipe_resource *
+agx_resource_get_stencil(struct pipe_resource *prsrc)
+{
+   return (struct pipe_resource *)agx_resource(prsrc)->separate_stencil;
+}
+
+static void
 agx_resource_setup(struct agx_device *dev, struct agx_resource *nresource)
 {
    struct pipe_resource *templ = &nresource->base;
@@ -2342,19 +2355,6 @@ agx_destroy_screen(struct pipe_screen *pscreen)
    agx_close_device(&screen->dev);
    disk_cache_destroy(screen->disk_cache);
    ralloc_free(screen);
-}
-
-static void
-agx_resource_set_stencil(struct pipe_resource *prsrc,
-                         struct pipe_resource *stencil)
-{
-   agx_resource(prsrc)->separate_stencil = agx_resource(stencil);
-}
-
-static struct pipe_resource *
-agx_resource_get_stencil(struct pipe_resource *prsrc)
-{
-   return (struct pipe_resource *)agx_resource(prsrc)->separate_stencil;
 }
 
 static enum pipe_format
