@@ -654,17 +654,17 @@ static struct pipe_resource *
 agx_resource_from_memobj(struct pipe_screen *pscreen,
                          const struct pipe_resource *tmpl,
                          struct pipe_memory_object *pmemobj,
-                         uint64_t offset)
+                         uint64_t offset, bool allow_compressed)
 {
    struct agx_memory_object *memobj = agx_memory_object(pmemobj);
-   struct pipe_resource *prsc;
+   struct pipe_resource *prsc = NULL;
 
    assert(memobj->bo);
 
    /* We shouldn't get a scanout buffer here. */
    assert(!(tmpl->bind & PIPE_BIND_SCANOUT));
 
-   /* Can't handle combined depth and stencil yet. */
+   /* Can't handle combined depth and stencil, our wrapper handles it. */
    if (util_format_is_depth_and_stencil(tmpl->format))
       return NULL;
 
@@ -675,9 +675,11 @@ agx_resource_from_memobj(struct pipe_screen *pscreen,
    };
    int mod_cnt = ARRAY_SIZE(modifiers);
 
-   /* Allocate new pipe resource and attach the memobj's bo as backing. */
-   prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl, modifiers,
-                                                    mod_cnt, memobj->bo, offset);
+   /* Allocate (maybe compressed) new pipe resource and attach the memobj's bo. */
+   if (allow_compressed) {
+      prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl, modifiers,
+                                                       mod_cnt, memobj->bo, offset);
+   }
 
    /* Retry without DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED modifier
     * if we don't get a prsc first. There are a few scenarios where
@@ -687,6 +689,10 @@ agx_resource_from_memobj(struct pipe_screen *pscreen,
     * This results in resource creation failure, because the memobj->bo
     * from hk is too small to contain the expected compression surface.
     * Retrying without expecting a "compressed" bo may heal this.
+    *
+    * If !allow_compressed this is the only path. Needed as another fallback
+    * called by and agx_resource_from_memobj_wrapper if combined depth+stencil
+    * creation fails, to give it another try.
     */
    if (!prsc) {
       prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl,
@@ -698,6 +704,71 @@ agx_resource_from_memobj(struct pipe_screen *pscreen,
    return prsc;
 }
 
+/* Handle combined depth/stencil with memory objects.
+ *
+ * This function is mostly adapted from the Intel iris implementation,
+ * which is modeled after u_transfer_helper_resource_create.
+ */
+static struct pipe_resource *
+agx_resource_from_memobj_wrapper(struct pipe_screen *pscreen,
+                                 const struct pipe_resource *templ,
+                                 struct pipe_memory_object *pmemobj,
+                                 uint64_t offset)
+{
+   enum pipe_format format = templ->format;
+
+   /* Normal case, no special handling. Create possibly compressed resource. */
+   if (!(util_format_is_depth_and_stencil(format)))
+      return agx_resource_from_memobj(pscreen, templ, pmemobj, offset, true);
+
+   /* Combined depth+stencil. Need to split up into separate depth and stencil. */
+   bool allow_compressed = true;
+   struct pipe_resource *prsc = NULL;
+
+   while (!prsc) {
+      /* First create the depth buffer resource. */
+      struct pipe_resource t = *templ;
+      t.format = util_format_get_depth_only(format);
+      prsc = agx_resource_from_memobj(pscreen, &t, pmemobj, offset, allow_compressed);
+      if (!prsc)
+         return NULL;
+
+      /* Reset main resources format back to the "external" combined format */
+      prsc->format = format;
+
+      /* Then create the separate stencil buffer resource, at an offset directly
+       * behind the depth resource inside the imported memobj's backing bo.
+       */
+      struct agx_resource *rsc = agx_resource(prsc);
+
+      /* Compute stencil offset into the buffer.
+       * Only supported depth+stencil by hk is VK_FORMAT_D32_SFLOAT_S8_UINT, which is
+       * same as PIPE_FORMAT_Z32_FLOAT_S8X24_UINT, broken up into a PIPE_FORMAT_Z32_FLOAT
+       * depth buffer, followed by a PIPE_FORMAT_S8_UINT buffer inside the imported
+       * memory object's backing bo, with the start of the stencil plane aligned to
+       * plane_align_B = HK_PLANE_ALIGN_B = 128 bytes, as sparse images are not
+       * supported by GL_EXT_memory_object.
+       */
+      const unsigned plane_align_B = 128;
+      uint64_t s_offset = offset + align64(rsc->layout.size_B, plane_align_B);
+
+      t.format = PIPE_FORMAT_S8_UINT;
+      struct pipe_resource *stencil = agx_resource_from_memobj(pscreen, &t, pmemobj,
+                                                               s_offset, allow_compressed);
+      if (stencil) {
+         /* Assign stencil resource as a sidekick to "parent" resource prsc. */
+         agx_resource_set_stencil(prsc, stencil);
+      } else {
+         agx_resource_destroy(pscreen, prsc);
+         prsc = NULL;
+
+         /* If this was already the 2nd try without compression, give up. */
+         if (!allow_compressed)
+            return NULL;
+
+         /* Retry the whole process, trying without compressed formats. */
+         allow_compressed = false;
+      }
    }
 
    return prsc;
@@ -2600,7 +2671,7 @@ agx_screen_create(int fd, struct renderonly *ro,
    /* GL_EXT_memory_object */
    screen->memobj_create_from_handle = agx_memobj_create_from_handle;
    screen->memobj_destroy = agx_memobj_destroy;
-   screen->resource_from_memobj = agx_resource_from_memobj;
+   screen->resource_from_memobj = agx_resource_from_memobj_wrapper;
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->nir_options[i] = &agx_nir_options;
