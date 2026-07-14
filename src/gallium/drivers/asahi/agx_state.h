@@ -968,14 +968,14 @@ agx_memory_object(struct pipe_memory_object *pmemobj)
 static inline void *
 agx_map_texture_cpu(struct agx_resource *rsrc, unsigned level, unsigned z)
 {
-   return ((uint8_t *)agx_bo_map(rsrc->bo)) +
+   return ((uint8_t *)agx_bo_map(rsrc->bo)) + rsrc->layout.offset +
           ail_get_layer_level_B(&rsrc->layout, z, level);
 }
 
 static inline uint64_t
 agx_map_gpu(struct agx_resource *rsrc)
 {
-   return rsrc->bo->va->addr + rsrc->layout.level_offsets_B[0];
+   return rsrc->bo->va->addr + rsrc->layout.offset + rsrc->layout.level_offsets_B[0];
 }
 
 static inline uint64_t

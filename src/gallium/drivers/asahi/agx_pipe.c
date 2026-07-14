@@ -497,7 +497,8 @@ static struct pipe_resource *
 agx_resource_create_with_modifiers_opt_bo(struct pipe_screen *screen,
                                           const struct pipe_resource *templ,
                                           const uint64_t *modifiers, int count,
-                                          struct agx_bo *bo_attach)
+                                          struct agx_bo *bo_attach,
+                                          uint64_t offset)
 {
    struct agx_device *dev = agx_device(screen);
    struct agx_resource *nresource;
@@ -541,6 +542,10 @@ agx_resource_create_with_modifiers_opt_bo(struct pipe_screen *screen,
    agx_resource_setup(dev, nresource);
 
    pipe_reference_init(&nresource->base.reference, 1);
+
+   /* If importing a bo, allow binding at an offset into it. */
+   if (bo_attach)
+      nresource->layout.offset = offset;
 
    ail_make_miptree(&nresource->layout);
 
@@ -597,7 +602,7 @@ agx_resource_create_with_modifiers_opt_bo(struct pipe_screen *screen,
       nresource->bo = agx_bo_create(dev, nresource->layout.size_B, 0, create_flags, label);
 
      /* bo to attach provided. Validate minimum size and subset of flags, if ok attach. */
-   } else if ((bo_attach->size >= nresource->layout.size_B) &&
+   } else if ((bo_attach->size >= nresource->layout.size_B + nresource->layout.offset) &&
               ((bo_attach->flags & create_flags) == create_flags)) {
       nresource->bo = bo_attach;
       agx_bo_reference(nresource->bo);
@@ -617,7 +622,7 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
                                    const struct pipe_resource *templ,
                                    const uint64_t *modifiers, int count)
 {
-   return agx_resource_create_with_modifiers_opt_bo(screen, templ, modifiers, count, NULL);
+   return agx_resource_create_with_modifiers_opt_bo(screen, templ, modifiers, count, NULL, 0);
 }
 
 static struct pipe_resource *
@@ -649,13 +654,12 @@ static struct pipe_resource *
 agx_resource_from_memobj(struct pipe_screen *pscreen,
                          const struct pipe_resource *tmpl,
                          struct pipe_memory_object *pmemobj,
-                         ASSERTED uint64_t offset)
+                         uint64_t offset)
 {
    struct agx_memory_object *memobj = agx_memory_object(pmemobj);
    struct pipe_resource *prsc;
 
    assert(memobj->bo);
-   assert(offset == 0);
 
    /* We shouldn't get a scanout buffer here. */
    assert(!(tmpl->bind & PIPE_BIND_SCANOUT));
@@ -673,7 +677,7 @@ agx_resource_from_memobj(struct pipe_screen *pscreen,
 
    /* Allocate new pipe resource and attach the memobj's bo as backing. */
    prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl, modifiers,
-                                                    mod_cnt, memobj->bo);
+                                                    mod_cnt, memobj->bo, offset);
 
    /* Retry without DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED modifier
     * if we don't get a prsc first. There are a few scenarios where
@@ -688,7 +692,12 @@ agx_resource_from_memobj(struct pipe_screen *pscreen,
       prsc = agx_resource_create_with_modifiers_opt_bo(pscreen, tmpl,
                                                        &modifiers[1],
                                                        mod_cnt - 1,
-                                                       memobj->bo);
+                                                       memobj->bo, offset);
+   }
+
+   return prsc;
+}
+
    }
 
    return prsc;

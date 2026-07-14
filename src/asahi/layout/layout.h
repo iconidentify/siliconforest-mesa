@@ -97,6 +97,11 @@ struct ail_layout {
    bool page_aligned_layers;
 
    /**
+    * Offset at which the layout data starts from start of the BO.
+    */
+   uint64_t offset;
+
+   /**
     * Offsets of mip levels within a layer.
     */
    uint64_t level_offsets_B[AIL_MAX_MIP_LEVELS];
