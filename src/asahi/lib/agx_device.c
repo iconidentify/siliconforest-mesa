@@ -541,7 +541,22 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    assert(params_size >= sizeof(dev->params));
 
-   assert(dev->params.gpu_generation >= 13);
+   dev->chip = agx_chip_from_params(&dev->params);
+   if (dev->chip == AGX_CHIP_UNKNOWN) {
+      fprintf(stderr,
+              "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "
+              "clusters)\n",
+              dev->params.gpu_generation, dev->params.gpu_variant,
+              dev->params.num_clusters_total);
+
+      if (dev->is_virtio) {
+         vdrm_device_close(dev->vdrm);
+         dev->vdrm = NULL;
+      }
+
+      return false;
+   }
+
    const char *variant = " Unknown";
    switch (dev->params.gpu_variant) {
    case 'G':
@@ -657,17 +672,6 @@ agx_open_device(void *memctx, struct agx_device *dev)
       dev->libagx_programs = libagx_g13x;
    } else {
       dev->libagx_programs = libagx_g13g;
-   }
-
-   if (dev->params.gpu_generation >= 14 && dev->params.num_clusters_total > 1) {
-      dev->chip = AGX_CHIP_G14X;
-   } else if (dev->params.gpu_generation >= 14) {
-      dev->chip = AGX_CHIP_G14G;
-   } else if (dev->params.gpu_generation >= 13 &&
-              dev->params.num_clusters_total > 1) {
-      dev->chip = AGX_CHIP_G13X;
-   } else {
-      dev->chip = AGX_CHIP_G13G;
    }
 
    /* Bind read-only zero page at 2^32. This is in our reservation, and can be

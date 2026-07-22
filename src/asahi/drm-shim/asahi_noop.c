@@ -13,6 +13,7 @@ static const struct drm_asahi_params_global params = {
    .gpu_generation = 13,
    .gpu_variant = 'G',
    .gpu_revision = 0,
+   .num_clusters_total = 1,
    .vm_start = 0x4000,
    .vm_end = 0x7fffff8000ull,
    .command_timestamp_frequency_hz = 1000000000,

@@ -6,6 +6,7 @@
 libasahi_lib_files = files(
   'agx_bo.c',
   'agx_border.c',
+  'agx_chip.c',
   'agx_device.c',
   'agx_device_virtio.c',
   'agx_linker.c',
@@ -74,6 +75,7 @@ if with_tests
     executable(
       'libasahi_tests',
       files(
+        'tests/test-device.cpp',
         'tests/test-packing.cpp',
         'tests/test-tilebuffer.cpp',
       ),

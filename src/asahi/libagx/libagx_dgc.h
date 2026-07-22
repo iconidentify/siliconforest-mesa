@@ -8,6 +8,7 @@
 #include "compiler/libcl/libcl.h"
 #include "compiler/shader_enums.h"
 #include "agx_pack.h"
+#include "lib/agx_chip.h"
 
 #define agx_push(ptr, T, cfg)                                                  \
    for (unsigned _loop = 0; _loop < 1;                                         \
@@ -212,13 +213,6 @@ agx_direct_draw_overreads_indices(struct agx_draw d)
    uint32_t range_B = agx_indices_to_B(d.start + d.b.count[0], d.index_size);
    return range_B > d.index_buffer_range_B;
 }
-
-enum agx_chip {
-   AGX_CHIP_G13G,
-   AGX_CHIP_G13X,
-   AGX_CHIP_G14G,
-   AGX_CHIP_G14X,
-};
 
 static inline GLOBAL uint32_t *
 agx_cdm_launch(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_grid grid,
