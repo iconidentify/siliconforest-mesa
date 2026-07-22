@@ -6,6 +6,7 @@
 libasahi_lib_files = files(
   'agx_bo.c',
   'agx_border.c',
+  'agx_chip.c',
   'agx_device.c',
   'agx_device_virtio.c',
   'agx_linker.c',
@@ -74,12 +75,13 @@ if with_tests
     executable(
       'libasahi_tests',
       files(
+        'tests/test-device.cpp',
         'tests/test-packing.cpp',
         'tests/test-tilebuffer.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
-      dependencies: [idep_gtest, idep_agx_pack, idep_mesautil],
+      dependencies: [idep_gtest, idep_agx_pack, idep_libagx, idep_mesautil],
       link_with : [libasahi_lib, libasahi_layout],
     ),
     suite : ['asahi'],
