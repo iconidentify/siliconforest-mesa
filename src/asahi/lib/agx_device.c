@@ -542,12 +542,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(params_size >= sizeof(dev->params));
 
    dev->chip = agx_chip_from_params(&dev->params);
-   if (dev->chip == AGX_CHIP_UNKNOWN) {
+   if (!agx_chip_supported(dev->chip)) {
       fprintf(stderr,
-              "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "
-              "clusters)\n",
-              dev->params.gpu_generation, dev->params.gpu_variant,
-              dev->params.num_clusters_total);
+              "Unsupported Apple GPU architecture %s (generation G%u, variant "
+              "0x%x, %u clusters)\n",
+              agx_chip_name(dev->chip), dev->params.gpu_generation,
+              dev->params.gpu_variant, dev->params.num_clusters_total);
 
       if (dev->is_virtio) {
          vdrm_device_close(dev->vdrm);

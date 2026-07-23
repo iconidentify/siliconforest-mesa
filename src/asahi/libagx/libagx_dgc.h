@@ -218,6 +218,25 @@ enum agx_chip {
    AGX_CHIP_G13X,
    AGX_CHIP_G14G,
    AGX_CHIP_G14X,
+
+   /*
+    * Recognized but NOT yet supported. No validated command-stream, ISA,
+    * initdata, UAT, or firmware contract exists for these architectures, so
+    * agx_open_device() still fails closed on them (see agx_chip_supported()).
+    * They exist only so the driver can name post-M2 hardware precisely instead
+    * of silently misclassifying it as G14X.
+    *
+    * Note the G17P (HAL200) exception: it reuses the G16 / archive-generation-2
+    * metadata, so a "generation >= N" test is never a valid dispatch. Selection
+    * must stay on exact (generation, variant) tuples.
+    */
+   AGX_CHIP_G15G,
+   AGX_CHIP_G15X,
+   AGX_CHIP_G16G,
+   AGX_CHIP_G16X,
+   AGX_CHIP_G17G,
+   AGX_CHIP_G17X,
+
    AGX_CHIP_UNKNOWN,
 };
 
