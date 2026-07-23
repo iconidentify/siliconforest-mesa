@@ -86,3 +86,49 @@ agx_chip_name(enum agx_chip chip)
 
    return "unknown";
 }
+
+/*
+ * Grounded static parameters, keyed by identity. Every value is either VERIFIED
+ * from captured evidence (see agx_chip.h header note) or an explicit UNKNOWN
+ * sentinel -- nothing here is guessed, and none of it enables a chip.
+ */
+static const struct agx_chip_info agx_chip_infos[] = {
+   /* Gen2 baseline: predates the post-M2 archive/IFT ladder. */
+   [AGX_CHIP_G13G] = {.isa_gen = AGX_ISA_GEN2},
+   [AGX_CHIP_G13X] = {.isa_gen = AGX_ISA_GEN2},
+   [AGX_CHIP_G14G] = {.isa_gen = AGX_ISA_GEN2},
+   [AGX_CHIP_G14X] = {.isa_gen = AGX_ISA_GEN2},
+
+   /* G15/M3: Gen3, archive gen 1, IFT gen 1. USC gen not captured. */
+   [AGX_CHIP_G15G] = {.isa_gen = AGX_ISA_GEN3, .archive_gen = 1, .ift_gen = 1},
+   [AGX_CHIP_G15X] = {.isa_gen = AGX_ISA_GEN3, .archive_gen = 1, .ift_gen = 1},
+
+   /* G16/M4: Gen3, archive gen 2, IFT gen 1. USC gen not captured. */
+   [AGX_CHIP_G16G] = {.isa_gen = AGX_ISA_GEN3, .archive_gen = 2, .ift_gen = 1},
+   [AGX_CHIP_G16X] = {.isa_gen = AGX_ISA_GEN3, .archive_gen = 2, .ift_gen = 1},
+
+   /*
+    * G17/M5 (HAL300): Gen3, archive gen 3, IFT gen 2. USC gen 3 is VERIFIED
+    * only for G17X (the live G17S ioreg); G17G stays UNKNOWN. G17P (HAL200,
+    * archive gen 2) is intentionally not a separate identity; no "gen >= 17".
+    */
+   [AGX_CHIP_G17G] = {.isa_gen = AGX_ISA_GEN3,
+                      .archive_gen = 3,
+                      /* usc_gen UNKNOWN: only the G17S/X part was captured */
+                      .ift_gen = 2},
+   [AGX_CHIP_G17X] = {.isa_gen = AGX_ISA_GEN3,
+                      .archive_gen = 3,
+                      .ift_gen = 2,
+                      .usc_gen = 3},
+
+   [AGX_CHIP_UNKNOWN] = {.isa_gen = AGX_ISA_GEN_UNKNOWN},
+};
+
+const struct agx_chip_info *
+agx_chip_get_info(enum agx_chip chip)
+{
+   if ((unsigned)chip >= (sizeof(agx_chip_infos) / sizeof(agx_chip_infos[0])))
+      return &agx_chip_infos[AGX_CHIP_UNKNOWN];
+
+   return &agx_chip_infos[chip];
+}
