@@ -2010,6 +2010,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    pctx->create_fence_fd = agx_create_fence_fd;
    pctx->fence_server_sync = agx_fence_server_sync;
+   pctx->fence_server_signal = agx_fence_server_signal;
 
    pctx->get_device_reset_status = asahi_get_device_reset_status;
 
@@ -2231,6 +2232,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->anisotropic_filter = true;
    caps->native_fence_fd = true;
    caps->texture_barrier = true;
+   caps->fence_signal = true;
 
    /* Timer resolution is the length of a single tick in nanos */
    caps->timer_resolution = agx_gpu_timestamp_to_ns(agx_device(pscreen), 1);

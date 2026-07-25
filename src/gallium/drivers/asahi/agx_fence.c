@@ -7,6 +7,7 @@
  * Copyright 2018 Alyssa Rosenzweig
  * Copyright 2019 Collabora, Ltd.
  * Copyright 2012 Rob Clark
+ * Copyright 2026 Mario Kleiner
  * SPDX-License-Identifier: MIT
  */
 
@@ -102,6 +103,7 @@ agx_fence_from_fd(struct agx_context *ctx, int fd, enum pipe_fd_type type)
    }
 
    pipe_reference_init(&f->reference, 1);
+   f->type = type;
 
    return f;
 
@@ -148,16 +150,69 @@ agx_create_fence_fd(struct pipe_context *pctx,
 
 void
 agx_fence_server_sync(struct pipe_context *pctx, struct pipe_fence_handle *f,
-                      uint64_t value)
+                      ASSERTED uint64_t value)
+{
+   struct agx_device *dev = agx_device(pctx->screen);
+   struct agx_context *ctx = agx_context(pctx);
+   uint64_t zero = 0;
+   int fd = -1, ret;
+   assert(!value);
+
+   if (!f->syncobj)
+      return;
+
+   /* Wait for the f->syncobj to have a (exportable) sync fence assigned.
+    * This can take dozens to even low hundreds usecs in practice if the
+    * signal operation is offloaded to some separate thread, e.g., a syncobj
+    * shared with Honeykrisp, and hk using VK_QUEUE_SUBMIT_MODE_THREADED for
+    * queue submits.
+    */
+   ret = drmSyncobjTimelineWait(dev->fd, &f->syncobj, &zero, 1, INT64_MAX,
+                                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, NULL);
+   assert(!ret && "Wait for sync fence availability");
+
+   /* Transfer sync fence to be waited on by the contexts command stream. */
+   ret = drmSyncobjExportSyncFile(dev->fd, f->syncobj, &fd);
+   assert(!ret && "Sync object export of sync fence fd");
+
+   sync_accumulate("asahi", &ctx->in_sync_fd, fd);
+   close(fd);
+
+   /* Need to remove the fence from the sync object, now that ctx->in_sync_fd
+    * has taken hold of the fence. This to implement "reset the semaphore to
+    * unsignaled after wait" semantics of glWaitSemaphoreEXT().
+    */
+   if (f->type == PIPE_FD_TYPE_SYNCOBJ) {
+      ret = drmSyncobjReset(dev->fd, &f->syncobj, 1);
+      assert(!ret && "Sync object reset");
+   }
+}
+
+void
+agx_fence_server_signal(struct pipe_context *pctx, struct pipe_fence_handle *f,
+                        ASSERTED uint64_t value)
 {
    struct agx_device *dev = agx_device(pctx->screen);
    struct agx_context *ctx = agx_context(pctx);
    int fd = -1, ret;
    assert(!value);
 
-   ret = drmSyncobjExportSyncFile(dev->fd, f->syncobj, &fd);
-   assert(!ret);
+   if (!f->syncobj)
+      return;
 
-   sync_accumulate("asahi", &ctx->in_sync_fd, fd);
+   /* Flush all current pending rendering. */
+   pctx->flush(pctx, NULL, 0);
+
+   /* Export our context's final "render complete" signal syncobj to a sync file. */
+   ret = drmSyncobjExportSyncFile(dev->fd, ctx->syncobj, &fd);
+   assert(!ret && "Sync object export of sync fence fd");
+   assert(fd >= 0 && "Get valid fd");
+
+   /* Import the sync file into our imported and externally shared sync object. */
+   ret = drmSyncobjImportSyncFile(dev->fd, f->syncobj, fd);
+   assert(!ret && "Fence import into external shared sync object");
+   if (ret)
+      agx_msg("import syncfile failed\n");
+
    close(fd);
 }

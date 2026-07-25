@@ -1,6 +1,8 @@
 VK_AMD_anti_lag on RADV
 GL_EXT_memory_object on asahi
 GL_EXT_memory_object_fd on asahi
+GL_EXT_semaphore on asahi
+GL_EXT_semaphore_fd on asahi
 VK_IMG_filter_linear_2d on pvr
 VK_KHR_maintenance7 on pvr
 Vulkan 1.3 on panvk/v6-7
