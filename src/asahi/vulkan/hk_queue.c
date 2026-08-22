@@ -412,7 +412,15 @@ union drm_asahi_cmd {
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
+#ifdef _WIN32
+   /* One command per D3DKMT SubmitCommand multiplies every WDDM transition,
+    * KMD validation walk, backing retain, and cache publication by the number
+    * of hardware commands in the frame. Windows has no DRM ioctl boundary to
+    * preserve here, and the shared contract accepts the firmware maximum. */
+   return 64;
+#else
    return HK_PERF(dev, BATCH) ? 64 : 1;
+#endif
 }
 
 static VkResult
