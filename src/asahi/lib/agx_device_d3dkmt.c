@@ -1075,7 +1075,9 @@ agx_d3dkmt_bo_export_external(
     * write-epoch protocol exists across the export boundary. */
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
    bo->d3dkmt_origin = AGX_D3DKMT_BO_EXPORTED;
-   bo->d3dkmt_conservative_dirty = true;
+   (void)agx_d3dkmt_cpu_map_request(
+      &bo->d3dkmt_cpu_map, &bo->d3dkmt_dirty, bo->size,
+      AGX_D3DKMT_CPU_MAP_RAW, false);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
    return 0;
 }
@@ -1445,14 +1447,13 @@ d3dkmt_bo_munmap(struct agx_device *dev, struct agx_bo *bo)
    if ((bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0)
       p_atomic_inc(&dev->read_set_generation);
 
-   /* Vulkan Unmap invalidates the application's raw pointer. Preserve the
-    * pending whole-BO write for the next submit, but stop republishing it on
-    * later submits once that ownership transition succeeds. Imported and
-    * exported allocations may still have a foreign persistent mapping. */
+   /* Unmap invalidates this process's pointer. Preserve pending ownership for
+    * the next submit; imported/exported origins remain conservative because a
+    * foreign mapping may still exist. */
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
-   if (bo->d3dkmt_origin == AGX_D3DKMT_BO_PRIVATE ||
-       bo->d3dkmt_origin == AGX_D3DKMT_BO_CREATED_SHAREABLE)
-      bo->d3dkmt_conservative_dirty = false;
+   if (bo->d3dkmt_cpu_map.conservative)
+      (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+   agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, false);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1514,12 +1515,36 @@ d3dkmt_bo_mark_cpu_dirty(struct agx_device *dev, struct agx_bo *bo,
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
    if (bo->d3dkmt_dirty.identity != 0) {
       if (!precise) {
-         bo->d3dkmt_conservative_dirty = true;
-         (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+         (void)agx_d3dkmt_cpu_map_request(
+            &bo->d3dkmt_cpu_map, &bo->d3dkmt_dirty, bo->size,
+            AGX_D3DKMT_CPU_MAP_RAW, false);
       } else {
          (void)agx_d3dkmt_dirty_mark(&bo->d3dkmt_dirty, bo->size, offset,
                                      size);
       }
+   }
+   simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
+}
+
+static void
+d3dkmt_bo_set_cpu_map_class(struct agx_device *dev, struct agx_bo *bo,
+                            enum agx_bo_cpu_map_class map_class)
+{
+   if (bo == NULL)
+      return;
+
+   simple_mtx_lock(&dev->d3dkmt_dirty_lock);
+   if (bo->d3dkmt_dirty.identity != 0) {
+      const bool tracked_allowed =
+         map_class == AGX_BO_CPU_MAP_TRACKED &&
+         bo->d3dkmt_origin == AGX_D3DKMT_BO_PRIVATE &&
+         (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0;
+      const enum agx_d3dkmt_cpu_map_class requested =
+         map_class == AGX_BO_CPU_MAP_TRACKED ? AGX_D3DKMT_CPU_MAP_TRACKED
+                                             : AGX_D3DKMT_CPU_MAP_RAW;
+      (void)agx_d3dkmt_cpu_map_request(
+         &bo->d3dkmt_cpu_map, &bo->d3dkmt_dirty, bo->size, requested,
+         tracked_allowed);
    }
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
@@ -1546,7 +1571,7 @@ d3dkmt_bo_reset_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
    /* The BO cache preserves a Lock2 mapping across logical lifetimes. Reset
     * runs before refcnt publication, so re-establish the mapped lifetime's
     * whole-BO ownership atomically with its new identity. */
-   bo->d3dkmt_conservative_dirty = bo->_map != NULL;
+   agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, bo->_map != NULL);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1556,8 +1581,8 @@ d3dkmt_bo_discard_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
    agx_d3dkmt_dirty_reset(&bo->d3dkmt_dirty,
                           d3dkmt_next_bo_identity(dev));
+   agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, false);
    bo->d3dkmt_origin = AGX_D3DKMT_BO_PRIVATE;
-   bo->d3dkmt_conservative_dirty = false;
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1677,7 +1702,7 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
       if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0)
          continue;
 
-      const bool conservative = bo->d3dkmt_conservative_dirty ||
+      const bool conservative = bo->d3dkmt_cpu_map.conservative ||
          bo->d3dkmt_origin == AGX_D3DKMT_BO_IMPORTED_EXTERNAL ||
          bo->d3dkmt_origin == AGX_D3DKMT_BO_EXPORTED;
       if (conservative)
@@ -2057,7 +2082,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       goto out;
    }
 
-   uint8_t *map = agx_bo_map(staging);
+   uint8_t *map = agx_bo_map_tracked(staging);
    if (map == NULL) {
       errno = ENOMEM;
       goto out;
@@ -2821,6 +2846,7 @@ const agx_device_ops_t agx_device_d3dkmt_ops = {
    .bo_sync_for_device = d3dkmt_bo_sync_for_device,
    .bo_sync_for_cpu = d3dkmt_bo_sync_for_cpu,
    .bo_mark_cpu_dirty = d3dkmt_bo_mark_cpu_dirty,
+   .bo_set_cpu_map_class = d3dkmt_bo_set_cpu_map_class,
    .bo_reset_cpu_dirty = d3dkmt_bo_reset_cpu_dirty,
    .bo_discard_cpu_dirty = d3dkmt_bo_discard_cpu_dirty,
    .bo_free = d3dkmt_bo_free,

@@ -621,7 +621,8 @@ hk_flush_bind(struct hk_bind_builder *b)
    if (b->image && b->image->planes[0].sparse_map != NULL) {
       assert(b->image->plane_count == 1 && "multiplane sparse not supported");
 
-      uint32_t *map = agx_bo_map(b->image->planes[0].sparse_map);
+      struct agx_bo *sparse_bo = b->image->planes[0].sparse_map;
+      uint32_t *map = agx_bo_map_tracked(sparse_bo);
       uint64_t size_page = ail_bytes_to_pages(b->size);
 
       struct ail_layout *layout = &b->image->planes[0].layout;
@@ -648,6 +649,9 @@ hk_flush_bind(struct hk_bind_builder *b)
          uint64_t page_in_layer = target_page % layer_stride_page;
          unsigned idx = ail_page_to_sparse_index_el(layout, z, page_in_layer);
 
+         agx_bo_mark_cpu_dirty(sparse_bo,
+                               (uint64_t)idx * sizeof(*map), sizeof(*map),
+                               true);
          agx_pack(map + idx, SPARSE_BLOCK, cfg) {
             cfg.enabled = b->mem != NULL;
             cfg.unknown = cfg.enabled;

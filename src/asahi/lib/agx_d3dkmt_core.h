@@ -545,6 +545,21 @@ struct agx_d3dkmt_dirty_snapshot {
       ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO];
 };
 
+/* CPU mappings are conservative unless the driver owns every writer to the
+ * pointer. UNKNOWN is used for a cached Lock2 mapping before its new logical
+ * owner declares how it will write. */
+enum agx_d3dkmt_cpu_map_class {
+   AGX_D3DKMT_CPU_MAP_UNMAPPED = 0,
+   AGX_D3DKMT_CPU_MAP_UNKNOWN,
+   AGX_D3DKMT_CPU_MAP_RAW,
+   AGX_D3DKMT_CPU_MAP_TRACKED,
+};
+
+struct agx_d3dkmt_cpu_map_state {
+   enum agx_d3dkmt_cpu_map_class map_class;
+   bool conservative;
+};
+
 enum agx_d3dkmt_dirty_result {
    AGX_D3DKMT_DIRTY_OK = 0,
    AGX_D3DKMT_DIRTY_STALE = 1,
@@ -578,6 +593,19 @@ agx_d3dkmt_dirty_commit(struct agx_d3dkmt_dirty_state *state,
 
 bool agx_d3dkmt_dirty_has_pending(
    const struct agx_d3dkmt_dirty_state *state);
+
+void agx_d3dkmt_cpu_map_reset(struct agx_d3dkmt_cpu_map_state *map,
+                              bool mapped);
+
+/* Request a raw or driver-tracked mapping. A tracked mapping is accepted only
+ * when the BO is private to this process and no raw pointer exists in this
+ * logical lifetime. Every transition into TRACKED owns one whole-BO snapshot
+ * before later exact dirty intervals may stand alone. Returns true iff tracked
+ * ownership was accepted. */
+bool agx_d3dkmt_cpu_map_request(
+   struct agx_d3dkmt_cpu_map_state *map,
+   struct agx_d3dkmt_dirty_state *dirty, uint64_t bo_size,
+   enum agx_d3dkmt_cpu_map_class requested, bool tracked_allowed);
 
 #ifdef __cplusplus
 }

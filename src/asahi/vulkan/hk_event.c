@@ -42,9 +42,10 @@ hk_CreateEvent(VkDevice device, const VkEventCreateInfo *pCreateInfo,
       vk_object_free(&dev->vk, pAllocator, event);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
-   event->status = agx_bo_map(event->bo);
+   event->status = agx_bo_map_tracked(event->bo);
    event->addr = event->bo->va->addr;
 
+   agx_bo_mark_cpu_dirty(event->bo, 0, HK_EVENT_MEM_SIZE, true);
    *event->status = VK_EVENT_RESET;
 
    *pEvent = hk_event_to_handle(event);
@@ -79,6 +80,7 @@ hk_SetEvent(VkDevice device, VkEvent _event)
 {
    VK_FROM_HANDLE(hk_event, event, _event);
 
+   agx_bo_mark_cpu_dirty(event->bo, 0, HK_EVENT_MEM_SIZE, true);
    *event->status = VK_EVENT_SET;
 
    return VK_SUCCESS;
@@ -89,6 +91,7 @@ hk_ResetEvent(VkDevice device, VkEvent _event)
 {
    VK_FROM_HANDLE(hk_event, event, _event);
 
+   agx_bo_mark_cpu_dirty(event->bo, 0, HK_EVENT_MEM_SIZE, true);
    *event->status = VK_EVENT_RESET;
 
    return VK_SUCCESS;

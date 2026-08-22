@@ -1097,8 +1097,10 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
       /* Zero-initialize the sparse map. This ensures all tiles are disabled,
        * which provides correct behaviour for unmapped tiles.
        */
-      memset(agx_bo_map(plane->sparse_map), 0,
-             plane->layout.sparse_table_size_B);
+      void *sparse_map = agx_bo_map_tracked(plane->sparse_map);
+      agx_bo_mark_cpu_dirty(plane->sparse_map, 0,
+                            plane->layout.sparse_table_size_B, true);
+      memset(sparse_map, 0, plane->layout.sparse_table_size_B);
    }
 
    return VK_SUCCESS;

@@ -72,9 +72,14 @@ agx_pool_alloc_aligned_with_bo(struct agx_pool *pool, size_t sz,
    pool->transient_offset = offset + sz;
 
    struct agx_ptr ret = {
-      .cpu = agx_bo_map(bo) + offset,
+      .cpu = agx_bo_map_tracked(bo) + offset,
       .gpu = bo->va->addr + offset,
    };
+
+   /* Pool storage is monotonic and private to the pool until its owner submits
+    * the batch/cache entry. The returned slice is the complete writable
+    * extent; publish that exact extent before handing out its CPU pointer. */
+   agx_bo_mark_cpu_dirty(bo, offset, sz, true);
 
    if (out_bo)
       *out_bo = bo;

@@ -38,7 +38,7 @@ hk_descriptor_table_grow_locked(struct hk_device *dev,
                        "Failed to allocate the descriptor table");
    }
 
-   void *new_map = agx_bo_map(new_bo);
+   void *new_map = agx_bo_map_tracked(new_bo);
 
    assert(table->bo == NULL && "not yet implemented sparse binding");
    table->bo = new_bo;
@@ -148,6 +148,8 @@ hk_descriptor_table_add_locked(struct hk_device *dev,
    void *map = (char *)table->map + (*index_out * table->desc_size);
 
    assert(desc_size == table->desc_size);
+   agx_bo_mark_cpu_dirty(table->bo, *index_out * table->desc_size,
+                         table->desc_size, true);
    memcpy(map, desc_data, table->desc_size);
 
    return VK_SUCCESS;
@@ -174,6 +176,8 @@ hk_descriptor_table_remove(struct hk_device *dev,
    simple_mtx_lock(&table->mutex);
 
    void *map = (char *)table->map + (index * table->desc_size);
+   agx_bo_mark_cpu_dirty(table->bo, index * table->desc_size,
+                         table->desc_size, true);
    memset(map, 0, table->desc_size);
 
    /* Sanity check for double-free */

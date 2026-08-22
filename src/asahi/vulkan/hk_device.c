@@ -70,7 +70,7 @@ hk_upload_rodata(struct hk_device *dev)
    if (!dev->rodata.bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   uint8_t *map = agx_bo_map(dev->rodata.bo);
+   uint8_t *map = agx_bo_map_tracked(dev->rodata.bo);
    uint32_t offs = 0;
 
    offs = align(offs, 8);
@@ -81,6 +81,7 @@ hk_upload_rodata(struct hk_device *dev)
    }
 
    agx_pack_txf_sampler((struct agx_sampler_packed *)(map + offs));
+   agx_bo_mark_cpu_dirty(dev->rodata.bo, offs, AGX_SAMPLER_LENGTH, true);
    offs += AGX_SAMPLER_LENGTH;
 
    /* The heap descriptor isn't strictly readonly data, but we only have a
@@ -258,6 +259,10 @@ static VkResult
 hk_check_status(struct vk_device *device)
 {
    struct hk_device *dev = container_of(device, struct hk_device, vk);
+
+   /* u_printf_with_ctx may reset the GPU-produced head word. Marking it before
+    * every status probe safely over-approximates the no-output fast path. */
+   agx_bo_mark_cpu_dirty(dev->dev.printf.bo, 0, sizeof(uint32_t), true);
    return vk_check_printf_status(&dev->vk, &dev->dev.printf);
 }
 

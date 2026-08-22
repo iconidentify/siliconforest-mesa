@@ -343,6 +343,59 @@ agx_d3dkmt_dirty_has_pending(const struct agx_d3dkmt_dirty_state *state)
    return state != NULL && (state->whole_bo || state->range_count != 0);
 }
 
+void
+agx_d3dkmt_cpu_map_reset(struct agx_d3dkmt_cpu_map_state *map, bool mapped)
+{
+   if (map == NULL)
+      return;
+
+   map->map_class = mapped ? AGX_D3DKMT_CPU_MAP_UNKNOWN
+                           : AGX_D3DKMT_CPU_MAP_UNMAPPED;
+   map->conservative = mapped;
+}
+
+bool
+agx_d3dkmt_cpu_map_request(struct agx_d3dkmt_cpu_map_state *map,
+                           struct agx_d3dkmt_dirty_state *dirty,
+                           uint64_t bo_size,
+                           enum agx_d3dkmt_cpu_map_class requested,
+                           bool tracked_allowed)
+{
+   if (map == NULL || dirty == NULL ||
+       (requested != AGX_D3DKMT_CPU_MAP_RAW &&
+        requested != AGX_D3DKMT_CPU_MAP_TRACKED))
+      return false;
+
+   if (requested == AGX_D3DKMT_CPU_MAP_TRACKED && tracked_allowed &&
+       map->map_class != AGX_D3DKMT_CPU_MAP_RAW) {
+      /* A fresh map or cache reuse first publishes a complete snapshot. Cache
+       * reset already installed that whole snapshot, so do not manufacture a
+       * second epoch while it is still pending. */
+      if (map->map_class != AGX_D3DKMT_CPU_MAP_TRACKED &&
+          !dirty->whole_bo &&
+          agx_d3dkmt_dirty_mark_whole(dirty, bo_size) !=
+             AGX_D3DKMT_DIRTY_OK)
+         goto raw;
+
+      map->map_class = AGX_D3DKMT_CPU_MAP_TRACKED;
+      map->conservative = false;
+      return true;
+   }
+
+raw:
+   /* Raw/application pointers have no callback for their next store. Ensure
+    * the first raw lifetime is published now; build-submit will republish it
+    * after every accepted submit while conservative remains set. */
+   if ((map->map_class != AGX_D3DKMT_CPU_MAP_RAW || !map->conservative) &&
+       agx_d3dkmt_dirty_mark_whole(dirty, bo_size) !=
+          AGX_D3DKMT_DIRTY_OK)
+      return false;
+
+   map->map_class = AGX_D3DKMT_CPU_MAP_RAW;
+   map->conservative = true;
+   return false;
+}
+
 /* -------------------------------------------------------------------------
  * Handle pool.
  * ------------------------------------------------------------------------- */

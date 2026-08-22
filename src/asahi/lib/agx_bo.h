@@ -132,8 +132,8 @@ struct agx_bo {
     * receives a new identity before reuse so an older failed submit cannot
     * restore dirty intervals into the new owner. */
    struct agx_d3dkmt_dirty_state d3dkmt_dirty;
+   struct agx_d3dkmt_cpu_map_state d3dkmt_cpu_map;
    enum agx_d3dkmt_bo_origin d3dkmt_origin;
-   bool d3dkmt_conservative_dirty;
 #endif
 };
 

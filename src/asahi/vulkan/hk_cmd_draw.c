@@ -1014,8 +1014,9 @@ hk_heap(struct hk_cmd_buffer *cmd)
        * Publish the descriptor before publishing the BO pointer.
        */
       off_t off = dev->rodata.heap - dev->rodata.bo->va->addr;
-      struct poly_heap *map = agx_bo_map(dev->rodata.bo) + off;
+      struct poly_heap *map = agx_bo_map_tracked(dev->rodata.bo) + off;
 
+      agx_bo_mark_cpu_dirty(dev->rodata.bo, off, sizeof(*map), true);
       *map = (struct poly_heap){
          .base = heap->va->addr,
          .size = size,

@@ -42,7 +42,7 @@ hk_has_available(const struct hk_query_pool *pool)
 static uint16_t *
 hk_pool_oq_index_ptr(const struct hk_query_pool *pool)
 {
-   return agx_bo_map(pool->bo) + pool->query_start;
+   return agx_bo_map_tracked(pool->bo) + pool->query_start;
 }
 
 static uint32_t
@@ -90,7 +90,7 @@ hk_query_available_map(struct hk_query_pool *pool, uint32_t query)
 {
    assert(hk_has_available(pool));
    assert(query < pool->vk.query_count);
-   return (uint32_t *)agx_bo_map(pool->bo) + query;
+   return (uint32_t *)agx_bo_map_tracked(pool->bo) + query;
 }
 
 static uint64_t
@@ -118,12 +118,13 @@ hk_query_report_map(struct hk_device *dev, struct hk_query_pool *pool,
                     uint32_t query)
 {
    if (pool->oq_queries) {
-      uint64_t *queries = (uint64_t *)agx_bo_map(dev->occlusion_queries.bo);
+      uint64_t *queries =
+         (uint64_t *)agx_bo_map_tracked(dev->occlusion_queries.bo);
       uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
 
       return (struct hk_query_report *)&queries[oq_index[query]];
    } else {
-      return (void *)((char *)agx_bo_map(pool->bo) +
+      return (void *)((char *)agx_bo_map_tracked(pool->bo) +
                       hk_query_offset(pool, query));
    }
 }
@@ -222,12 +223,28 @@ host_zero_queries(struct hk_device *dev, struct hk_query_pool *pool,
       uint64_t value = 0;
       if (hk_has_available(pool)) {
          uint32_t *available = hk_query_available_map(pool, first_index + i);
+         agx_bo_mark_cpu_dirty(pool->bo,
+                               (uint64_t)(first_index + i) * sizeof(*available),
+                               sizeof(*available), true);
          *available = set_available;
       } else {
          value = set_available ? 0 : LIBAGX_QUERY_UNAVAILABLE;
       }
 
-      for (unsigned j = 0; j < hk_reports_per_query(pool); ++j) {
+      const uint32_t reports_per_query = hk_reports_per_query(pool);
+      if (pool->oq_queries) {
+         const uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
+         agx_bo_mark_cpu_dirty(
+            dev->occlusion_queries.bo,
+            (uint64_t)oq_index[first_index + i] * sizeof(uint64_t),
+            (uint64_t)reports_per_query * sizeof(*reports), true);
+      } else {
+         agx_bo_mark_cpu_dirty(
+            pool->bo, hk_query_offset(pool, first_index + i),
+            (uint64_t)reports_per_query * sizeof(*reports), true);
+      }
+
+      for (unsigned j = 0; j < reports_per_query; ++j) {
          reports[j].value = value;
       }
    }
@@ -311,6 +328,11 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
 
       /* We increment as we go so we can clean up properly if we run out */
       assert(pool->oq_queries < occlusion_queries);
+      agx_bo_mark_cpu_dirty(
+         pool->bo,
+         pool->query_start +
+            (uint64_t)pool->oq_queries * sizeof(*oq_index),
+         sizeof(*oq_index), true);
       oq_index[pool->oq_queries++] = index;
    }
 

@@ -79,7 +79,9 @@ struct hk_descriptor_set {
    struct list_head link;
 
    struct hk_descriptor_set_layout *layout;
+   struct agx_bo *bo;
    void *mapped_ptr;
+   uint64_t bo_offset;
    uint64_t addr;
    uint32_t size;
 

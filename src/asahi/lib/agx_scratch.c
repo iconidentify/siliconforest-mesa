@@ -113,7 +113,8 @@ agx_scratch_realloc(struct agx_scratch *scratch)
 #endif
    scratch->buf = agx_bo_create(scratch->dev, total_alloc, block_size_bytes,
                                 flags, "Scratch");
-   void *map = agx_bo_map(scratch->buf);
+   void *map = agx_bo_map_tracked(scratch->buf);
+   agx_bo_mark_cpu_dirty(scratch->buf, 0, blocks_off, true);
    memset(map, 0, blocks_off);
 
    struct agx_helper_header *hdr = map;
@@ -217,6 +218,9 @@ agx_scratch_debug_pre(struct agx_scratch *scratch)
 {
    if (!scratch->buf)
       return;
+
+   agx_bo_mark_cpu_dirty(scratch->buf, 0,
+                         sizeof(struct agx_helper_header), true);
 
    for (int core = 0; core < scratch->max_core_id; core++) {
       assert(!scratch->header->cores[core].alloc_cur);

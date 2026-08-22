@@ -887,7 +887,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
       /* The contents of the scratch page are undefined, but making them nonzero
        * helps fuzz for bugs where we incorrectly read from the write section.
        */
-      memset(agx_bo_map(dev->scratch_bo), 0xCA, AIL_PAGESIZE);
+      void *scratch_map = agx_bo_map_tracked(dev->scratch_bo);
+      agx_bo_mark_cpu_dirty(dev->scratch_bo, 0, AIL_PAGESIZE, true);
+      memset(scratch_map, 0xCA, AIL_PAGESIZE);
    }
 
    void *bo = agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
@@ -910,7 +912,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail_bootstrap;
    }
 
-   u_printf_init(&dev->printf, bo, agx_bo_map(bo));
+   uint32_t *printf_map = agx_bo_map_tracked(bo);
+   agx_bo_mark_cpu_dirty(bo, 0, 2 * sizeof(*printf_map), true);
+   u_printf_init(&dev->printf, bo, printf_map);
    return true;
 
 fail_bootstrap:

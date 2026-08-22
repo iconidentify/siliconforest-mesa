@@ -135,7 +135,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       return;
    }
 
-   uint8_t *linked_map = agx_bo_map(linked->bo);
+   uint8_t *linked_map = agx_bo_map_tracked(linked->bo);
    if (!linked_map) {
       fprintf(stderr,
               "agx_fast_link: mapping the %zu B executable BO FAILED "

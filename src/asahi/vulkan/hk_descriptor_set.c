@@ -44,12 +44,26 @@ desc_ubo_data(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
 }
 
 static void
+mark_desc_write(struct hk_descriptor_set *set, const void *dst,
+                size_t size)
+{
+   if (set->bo == NULL || size == 0)
+      return;
+
+   const uintptr_t offset = (const uint8_t *)dst -
+                            (const uint8_t *)set->mapped_ptr;
+   assert(offset <= set->size && size <= set->size - offset);
+   agx_bo_mark_cpu_dirty(set->bo, set->bo_offset + offset, size, true);
+}
+
+static void
 write_desc(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
            const void *desc_data, size_t desc_size)
 {
    ASSERTED uint32_t dst_size;
    void *dst = desc_ubo_data(set, binding, elem, &dst_size);
    assert(desc_size <= dst_size);
+   mark_desc_write(set, dst, desc_size);
    memcpy(dst, desc_data, desc_size);
 }
 
@@ -355,6 +369,7 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
             const uint32_t copy_size =
                MIN2(dst_binding_layout->stride, src_binding_layout->stride);
             assert(copy_size <= dst_max_size && copy_size <= src_max_size);
+            mark_desc_write(dst, dst_map, copy_size);
             memcpy(dst_map, src_map, copy_size);
          }
       }
@@ -549,7 +564,7 @@ hk_CreateDescriptorPool(VkDevice _device,
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
 
-      pool->mapped_ptr = agx_bo_map(pool->bo);
+      pool->mapped_ptr = agx_bo_map_tracked(pool->bo);
 
       /* The BO may be larger thanks to GPU page alignment.  We may as well
        * make that extra space available to the client.
@@ -646,6 +661,8 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
          vk_object_free(&dev->vk, NULL, set);
          return result;
       }
+      set->bo = pool->bo;
+      set->bo_offset = set->addr - pool->bo->va->addr;
    }
 
    vk_descriptor_set_layout_ref(&layout->vk);

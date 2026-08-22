@@ -1266,6 +1266,128 @@ test_dirty_cached_mapping_reuse(void)
 }
 
 static void
+test_tracked_map_first_snapshot_accept_restore_and_exact_writes(void)
+{
+   const uint64_t bo_size = 0x40000;
+   struct agx_d3dkmt_dirty_state dirty;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   struct agx_d3dkmt_cpu_map_state map;
+
+   agx_d3dkmt_dirty_reset(&dirty, 901);
+   agx_d3dkmt_cpu_map_reset(&map, false);
+   CHECK(agx_d3dkmt_cpu_map_request(
+      &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_TRACKED, true));
+   CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_TRACKED);
+   CHECK(!map.conservative);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(snapshot.whole_bo);
+
+   /* A rejected SubmitCommand restores the initial ownership snapshot. */
+   CHECK_EQ(agx_d3dkmt_dirty_restore(&dirty, bo_size, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(snapshot.whole_bo);
+
+   /* Once accepted, an unchanged tracked mapping contributes no clean range;
+    * the next proven CPU write contributes only its aligned interval. */
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&dirty, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(!agx_d3dkmt_dirty_has_pending(&dirty));
+   CHECK(agx_d3dkmt_cpu_map_request(
+      &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_TRACKED, true));
+   CHECK(!agx_d3dkmt_dirty_has_pending(&dirty));
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&dirty, bo_size, 0x14123, 0x800),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(!snapshot.whole_bo);
+   CHECK_EQ(snapshot.range_count, 1);
+   CHECK_EQ(snapshot.ranges[0].offset, 0x14000);
+   CHECK_EQ(snapshot.ranges[0].length, 0x4000);
+}
+
+static void
+test_tracked_map_cache_reuse_and_conservative_exclusions(void)
+{
+   const uint64_t bo_size = 0x20000;
+   struct agx_d3dkmt_dirty_state dirty;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   struct agx_d3dkmt_cpu_map_state map;
+
+   /* A cached Lock2 pointer starts UNKNOWN with a whole snapshot. Claiming it
+    * as tracked preserves that one snapshot, then becomes precise. */
+   agx_d3dkmt_dirty_reset_mapped(&dirty, 910, bo_size, true);
+   agx_d3dkmt_cpu_map_reset(&map, true);
+   CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_UNKNOWN);
+   CHECK(map.conservative);
+   const uint64_t reset_epoch = dirty.cpu_write_epoch;
+   CHECK(agx_d3dkmt_cpu_map_request(
+      &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_TRACKED, true));
+   CHECK_EQ(dirty.cpu_write_epoch, reset_epoch);
+   CHECK(!map.conservative);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(snapshot.whole_bo);
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&dirty, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(!agx_d3dkmt_dirty_has_pending(&dirty));
+
+   /* Shared, imported, and exported BOs all pass tracked_allowed=false at the
+    * winsys boundary. They fall back to RAW and remain whole-BO conservative.
+    */
+   for (unsigned exclusion = 0; exclusion < 3; exclusion++) {
+      agx_d3dkmt_dirty_reset(&dirty, 920 + exclusion);
+      agx_d3dkmt_cpu_map_reset(&map, false);
+      CHECK(!agx_d3dkmt_cpu_map_request(
+         &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_TRACKED, false));
+      CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_RAW);
+      CHECK(map.conservative);
+      CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+      CHECK(snapshot.whole_bo);
+      CHECK_EQ(agx_d3dkmt_dirty_commit(&dirty, &snapshot),
+               AGX_D3DKMT_DIRTY_OK);
+      CHECK(!agx_d3dkmt_dirty_has_pending(&dirty));
+
+      /* This is the build-submit rule: a still-live conservative pointer may
+       * have written again without a callback, so republish the whole BO. */
+      if (map.conservative)
+         CHECK_EQ(agx_d3dkmt_dirty_mark_whole(&dirty, bo_size),
+                  AGX_D3DKMT_DIRTY_OK);
+      CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+      CHECK(snapshot.whole_bo);
+   }
+
+   /* HOST_COHERENT/application maps explicitly request RAW even for private
+    * BOs and therefore have the same conservative behavior. */
+   agx_d3dkmt_dirty_reset(&dirty, 930);
+   agx_d3dkmt_cpu_map_reset(&map, false);
+   CHECK(!agx_d3dkmt_cpu_map_request(
+      &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_RAW, true));
+   CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_RAW);
+   CHECK(map.conservative);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(snapshot.whole_bo);
+
+   /* A raw pointer stays valid for the logical BO lifetime. A later internal
+    * caller cannot revoke its unobservable write capability by requesting a
+    * tracked view of the same mapping. */
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&dirty, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(!agx_d3dkmt_cpu_map_request(
+      &map, &dirty, bo_size, AGX_D3DKMT_CPU_MAP_TRACKED, true));
+   CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_RAW);
+   CHECK(map.conservative);
+
+   /* Unmap ends the raw pointer's lifetime but must publish stores made since
+    * the last accepted submit before dropping conservative ownership. */
+   CHECK_EQ(agx_d3dkmt_dirty_mark_whole(&dirty, bo_size),
+            AGX_D3DKMT_DIRTY_OK);
+   agx_d3dkmt_cpu_map_reset(&map, false);
+   CHECK_EQ(map.map_class, AGX_D3DKMT_CPU_MAP_UNMAPPED);
+   CHECK(!map.conservative);
+   CHECK(agx_d3dkmt_dirty_detach(&dirty, &snapshot));
+   CHECK(snapshot.whole_bo);
+}
+
+static void
 test_invalidate_does_not_publish_a_flush(void)
 {
    struct agx_d3dkmt_dirty_state state;
@@ -1407,6 +1529,8 @@ main(void)
    test_dirty_detach_restore_and_stale_identity();
    test_dirty_repeated_unchanged_submit();
    test_dirty_cached_mapping_reuse();
+   test_tracked_map_first_snapshot_accept_restore_and_exact_writes();
+   test_tracked_map_cache_reuse_and_conservative_exclusions();
    test_invalidate_does_not_publish_a_flush();
    test_contract_blobs_we_emit();
 

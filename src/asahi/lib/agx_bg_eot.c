@@ -111,7 +111,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
       const volatile uint8_t *mapped =
          (offset != SIZE_MAX && offset <= res->bo->size &&
           size <= res->bo->size - offset)
-            ? (const volatile uint8_t *)agx_bo_map(res->bo) + offset
+            ? (const volatile uint8_t *)agx_bo_map_tracked(res->bo) + offset
             : NULL;
       size_t source_nonzero = 0, mapped_nonzero = 0;
       size_t source_main_nonzero = 0, mapped_main_nonzero = 0;

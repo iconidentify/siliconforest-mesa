@@ -521,6 +521,7 @@ struct hk_uploader {
    struct list_head bos;
 
    /* Current addresses */
+   struct agx_bo *bo;
    uint8_t *map;
    uint64_t base;
    uint32_t offset;

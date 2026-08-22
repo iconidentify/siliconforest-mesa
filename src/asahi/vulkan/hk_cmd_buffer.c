@@ -139,9 +139,11 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    hk_free_resettable_cmd_buffer(cmd);
 
    cmd->uploader.main.map = NULL;
+   cmd->uploader.main.bo = NULL;
    cmd->uploader.main.base = 0;
    cmd->uploader.main.offset = 0;
    cmd->uploader.usc.map = NULL;
+   cmd->uploader.usc.bo = NULL;
    cmd->uploader.usc.base = 0;
    cmd->uploader.usc.offset = 0;
 
@@ -202,13 +204,17 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
          return (struct agx_ptr){0};
       }
 
-      void *map = agx_bo_map(bo);
+      void *map = agx_bo_map_tracked(bo);
       if (unlikely(map == NULL)) {
          agx_bo_unreference(&dev->dev, bo);
          vk_command_buffer_set_error(&cmd->vk,
                                      VK_ERROR_MEMORY_MAP_FAILED);
          return (struct agx_ptr){0};
       }
+
+      /* The command buffer owns this entire oversize allocation and Vulkan
+       * forbids changing recorded storage while it is pending. */
+      agx_bo_mark_cpu_dirty(bo, 0, size, true);
 
       util_dynarray_append(&cmd->large_bos, bo);
       return (struct agx_ptr){
@@ -225,6 +231,11 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
    assert(offset <= HK_CMD_BO_SIZE);
    if (uploader->map != NULL && size <= HK_CMD_BO_SIZE - offset) {
       uploader->offset = offset + size;
+
+      /* Upload storage is monotonic for a recording. The returned interval is
+       * its complete CPU-writable extent and cannot be mutated while pending.
+       */
+      agx_bo_mark_cpu_dirty(uploader->bo, offset, size, true);
 
       return (struct agx_ptr){
          .gpu = uploader->base + offset,
@@ -246,10 +257,13 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
     * BO.
     */
    if (uploader->map == NULL || size < uploader->offset) {
-      uploader->map = agx_bo_map(bo->bo);
+      uploader->bo = bo->bo;
+      uploader->map = bo->map;
       uploader->base = bo->bo->va->addr;
       uploader->offset = size;
    }
+
+   agx_bo_mark_cpu_dirty(bo->bo, 0, size, true);
 
    return (struct agx_ptr){
       .gpu = bo->bo->va->addr,

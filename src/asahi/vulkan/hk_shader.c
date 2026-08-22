@@ -955,7 +955,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
          return;
       }
 
-      void *map = agx_bo_map(shader->bo);
+      void *map = agx_bo_map_tracked(shader->bo);
       if (!map) {
          fprintf(stderr,
                  "hk_upload_shader: mapping the %zu B preamble BO FAILED "

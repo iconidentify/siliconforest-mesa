@@ -93,6 +93,11 @@ struct agx_submit_virt {
    uint32_t ring_idx;
 };
 
+enum agx_bo_cpu_map_class {
+   AGX_BO_CPU_MAP_RAW = 0,
+   AGX_BO_CPU_MAP_TRACKED,
+};
+
 typedef struct {
    struct agx_bo *(*bo_alloc)(struct agx_device *dev, size_t size, size_t align,
                               enum agx_bo_flags flags);
@@ -143,6 +148,8 @@ typedef struct {
                           size_t offset, size_t size);
    void (*bo_mark_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo,
                              size_t offset, size_t size, bool precise);
+   void (*bo_set_cpu_map_class)(struct agx_device *dev, struct agx_bo *bo,
+                                enum agx_bo_cpu_map_class map_class);
    void (*bo_reset_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo);
    void (*bo_discard_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo);
    void (*bo_free)(struct agx_device *dev, uint32_t handle);
@@ -358,26 +365,43 @@ agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
 }
 
 static inline void *
-agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr)
+agx_bo_map_classified(struct agx_bo *bo, void *fixed_addr,
+                      enum agx_bo_cpu_map_class map_class)
 {
    if (!bo->_map) {
       bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr);
       if (bo->_map) {
          p_atomic_inc(&bo->dev->read_set_generation);
-         /* A raw persistent pointer has no later write callback. Keep the BO
-          * conservative for its mapped lifetime; HOST_COHERENT memory may be
-          * written again without a Vulkan Flush callback. */
-         agx_bo_mark_cpu_dirty(bo, 0, bo->size, false);
       }
    }
 
+   if (bo->_map && bo->dev->ops.bo_set_cpu_map_class)
+      bo->dev->ops.bo_set_cpu_map_class(bo->dev, bo, map_class);
+
    return bo->_map;
+}
+
+static inline void *
+agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr)
+{
+   /* A raw persistent pointer has no later write callback. Keep the BO
+    * conservative for its mapped lifetime; HOST_COHERENT memory may be
+    * written again without a Vulkan Flush callback. */
+   return agx_bo_map_classified(bo, fixed_addr, AGX_BO_CPU_MAP_RAW);
 }
 
 static inline void *
 agx_bo_map(struct agx_bo *bo)
 {
    return agx_bo_map_placed(bo, NULL);
+}
+
+/* Driver-internal mapping. The caller must publish every CPU-written interval
+ * with agx_bo_mark_cpu_dirty()/agx_bo_sync_for_device(). */
+static inline void *
+agx_bo_map_tracked(struct agx_bo *bo)
+{
+   return agx_bo_map_classified(bo, NULL, AGX_BO_CPU_MAP_TRACKED);
 }
 
 static inline bool
