@@ -1104,6 +1104,100 @@ test_read_range_canonicalization(void)
 }
 
 static void
+test_dirty_interval_merge_and_overflow(void)
+{
+   const uint64_t bo_size = 0x50000;
+   struct agx_d3dkmt_dirty_state state;
+   agx_d3dkmt_dirty_reset(&state, 17);
+
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, bo_size, 0x4100, 0x20),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, bo_size, 0x8000, 0x4000),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK_EQ(state.range_count, 1);
+   CHECK_EQ(state.ranges[0].offset, 0x4000);
+   CHECK_EQ(state.ranges[0].length, 0x8000);
+
+   agx_d3dkmt_dirty_reset(&state, 18);
+   for (uint32_t i = 0; i < AGX_D3DKMT_DIRTY_RANGES_PER_BO; i++) {
+      CHECK_EQ(agx_d3dkmt_dirty_mark(
+                  &state, bo_size, (uint64_t)i * 0x8000, 1),
+               AGX_D3DKMT_DIRTY_OK);
+   }
+   CHECK(!state.whole_bo);
+   CHECK_EQ(state.range_count, AGX_D3DKMT_DIRTY_RANGES_PER_BO);
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, bo_size, 0x44000, 1),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(state.whole_bo);
+   CHECK_EQ(state.range_count, 0);
+}
+
+static void
+test_dirty_detach_restore_and_stale_identity(void)
+{
+   struct agx_d3dkmt_dirty_state state;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   agx_d3dkmt_dirty_reset(&state, 91);
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, 0x20000, 0x8000, 4),
+            AGX_D3DKMT_DIRTY_OK);
+   const uint64_t write_epoch = state.cpu_write_epoch;
+   CHECK(agx_d3dkmt_dirty_detach(&state, &snapshot));
+   CHECK(!agx_d3dkmt_dirty_has_pending(&state));
+
+   /* A concurrent write after detach is retained when a failed submission
+    * restores its older snapshot. */
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, 0x20000, 0x10000, 4),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK_EQ(agx_d3dkmt_dirty_restore(&state, 0x20000, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK_EQ(state.range_count, 2);
+   CHECK(state.cpu_write_epoch > write_epoch);
+
+   /* Cache reuse establishes a new identity. An old submission may neither
+    * restore nor commit state into that new logical BO lifetime. */
+   agx_d3dkmt_dirty_reset(&state, 92);
+   CHECK_EQ(agx_d3dkmt_dirty_restore(&state, 0x20000, &snapshot),
+            AGX_D3DKMT_DIRTY_STALE);
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&state, &snapshot),
+            AGX_D3DKMT_DIRTY_STALE);
+   CHECK(!agx_d3dkmt_dirty_has_pending(&state));
+}
+
+static void
+test_dirty_repeated_unchanged_submit(void)
+{
+   struct agx_d3dkmt_dirty_state state;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   agx_d3dkmt_dirty_reset(&state, 123);
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, 0x10000, 0, 4),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(agx_d3dkmt_dirty_detach(&state, &snapshot));
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&state, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK_EQ(state.clean_epoch, snapshot.cpu_write_epoch);
+   CHECK(!agx_d3dkmt_dirty_detach(&state, &snapshot));
+}
+
+static void
+test_invalidate_does_not_publish_a_flush(void)
+{
+   struct agx_d3dkmt_dirty_state state;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   agx_d3dkmt_dirty_reset(&state, 700);
+
+   /* GPU -> CPU invalidation does not call dirty_mark. The following detach
+    * is the observable contract used by agx_bo_sync_for_cpu. */
+   CHECK(!agx_d3dkmt_dirty_detach(&state, &snapshot));
+
+   /* CPU -> GPU flush does publish the flushed interval. */
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, 0x10000, 0x4000, 16),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(agx_d3dkmt_dirty_detach(&state, &snapshot));
+   CHECK_EQ(snapshot.range_count, 1);
+   CHECK_EQ(snapshot.ranges[0].offset, 0x4000);
+}
+
+static void
 test_contract_blobs_we_emit(void)
 {
    /* Every blob this port hands the kernel must pass the kernel's own
@@ -1126,7 +1220,7 @@ test_contract_blobs_we_emit(void)
    } submit = {
       .header = {
          .base = {
-            .version = AGXW_SUBMIT_PRIVATE_VERSION,
+            .version = AGXW_SUBMIT_PRIVATE_VERSION_V3,
             .struct_size = sizeof(struct agxw_submit_private_v3),
             .flags = AGXW_SUBMIT_READ_SET_COMPLETE,
          },
@@ -1143,6 +1237,28 @@ test_contract_blobs_we_emit(void)
    submit.header.base.in_sync_count = 1;
    CHECK(agxw_submit_private_validate(&submit.header.base,
                                       sizeof(submit)) != 0);
+
+   struct {
+      struct agxw_submit_private_v5 header;
+      struct agxw_submit_read_range ranges[2];
+   } submit_v5 = {
+      .header = {
+         .base = {
+            .version = AGXW_SUBMIT_PRIVATE_VERSION_V5,
+            .struct_size = sizeof(struct agxw_submit_private_v5),
+            .flags = AGXW_SUBMIT_READ_SET_COMPLETE |
+                     AGXW_SUBMIT_CLEAN_SET_COMPLETE,
+         },
+         .read_range_count = 1,
+         .clean_range_count = 1,
+      },
+      .ranges = {
+         {0x1500000000ull, 0x8000},
+         {0x1500004000ull, 0x4000},
+      },
+   };
+   CHECK_EQ(agxw_submit_private_validate(&submit_v5.header.base,
+                                          sizeof(submit_v5)), 0);
 
    struct {
       struct agxw_escape_header hdr;
@@ -1199,6 +1315,10 @@ main(void)
    test_identity_parsing();
    test_alloc_flags();
    test_read_range_canonicalization();
+   test_dirty_interval_merge_and_overflow();
+   test_dirty_detach_restore_and_stale_identity();
+   test_dirty_repeated_unchanged_submit();
+   test_invalidate_does_not_publish_a_flush();
    test_contract_blobs_we_emit();
 
    if (failures) {

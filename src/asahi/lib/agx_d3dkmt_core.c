@@ -69,6 +69,200 @@ agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
    return AGX_D3DKMT_OK;
 }
 
+static bool
+dirty_range_align(uint64_t bo_size, uint64_t offset, uint64_t length,
+                  uint64_t *start, uint64_t *end)
+{
+   if (bo_size == 0 || (bo_size & (AGX_D3DKMT_PAGE_SIZE - 1)) != 0 ||
+       offset > bo_size || length > bo_size - offset)
+      return false;
+
+   if (length == 0) {
+      *start = *end = offset;
+      return true;
+   }
+
+   *start = offset & ~(AGX_D3DKMT_PAGE_SIZE - 1);
+   uint64_t byte_end = offset + length;
+   if (byte_end > UINT64_MAX - (AGX_D3DKMT_PAGE_SIZE - 1))
+      return false;
+   *end = (byte_end + AGX_D3DKMT_PAGE_SIZE - 1) &
+          ~(AGX_D3DKMT_PAGE_SIZE - 1);
+   if (*end > bo_size)
+      *end = bo_size;
+   return *start < *end;
+}
+
+static void
+dirty_next_epoch(struct agx_d3dkmt_dirty_state *state)
+{
+   state->cpu_write_epoch++;
+   if (state->cpu_write_epoch == 0)
+      state->cpu_write_epoch = 1;
+}
+
+static void
+dirty_make_whole(struct agx_d3dkmt_dirty_state *state)
+{
+   state->whole_bo = true;
+   state->range_count = 0;
+}
+
+static bool
+dirty_insert_aligned(struct agx_d3dkmt_dirty_state *state, uint64_t start,
+                     uint64_t end)
+{
+   if (state->whole_bo)
+      return true;
+
+   uint32_t first = 0;
+   while (first < state->range_count) {
+      const uint64_t range_end = state->ranges[first].offset +
+                                 state->ranges[first].length;
+      if (range_end >= start)
+         break;
+      first++;
+   }
+
+   if (first == state->range_count || end < state->ranges[first].offset) {
+      if (state->range_count == AGX_D3DKMT_DIRTY_RANGES_PER_BO) {
+         dirty_make_whole(state);
+         return true;
+      }
+
+      memmove(&state->ranges[first + 1], &state->ranges[first],
+              (size_t)(state->range_count - first) * sizeof(state->ranges[0]));
+      state->ranges[first] =
+         (struct agx_d3dkmt_dirty_range){start, end - start};
+      state->range_count++;
+      return true;
+   }
+
+   uint64_t merged_start = start < state->ranges[first].offset
+                              ? start
+                              : state->ranges[first].offset;
+   uint64_t merged_end = end;
+   const uint64_t first_end = state->ranges[first].offset +
+                              state->ranges[first].length;
+   if (first_end > merged_end)
+      merged_end = first_end;
+
+   uint32_t last = first + 1;
+   while (last < state->range_count &&
+          state->ranges[last].offset <= merged_end) {
+      const uint64_t range_end = state->ranges[last].offset +
+                                 state->ranges[last].length;
+      if (range_end > merged_end)
+         merged_end = range_end;
+      last++;
+   }
+
+   state->ranges[first] = (struct agx_d3dkmt_dirty_range){
+      merged_start, merged_end - merged_start};
+   if (last > first + 1) {
+      memmove(&state->ranges[first + 1], &state->ranges[last],
+              (size_t)(state->range_count - last) * sizeof(state->ranges[0]));
+      state->range_count -= last - (first + 1);
+   }
+   return true;
+}
+
+void
+agx_d3dkmt_dirty_reset(struct agx_d3dkmt_dirty_state *state,
+                       uint64_t identity)
+{
+   memset(state, 0, sizeof(*state));
+   state->identity = identity;
+}
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_mark(struct agx_d3dkmt_dirty_state *state, uint64_t bo_size,
+                      uint64_t offset, uint64_t length)
+{
+   if (state == NULL || state->identity == 0 || offset > bo_size ||
+       length > bo_size - offset)
+      return AGX_D3DKMT_DIRTY_INVALID;
+   if (length == 0)
+      return AGX_D3DKMT_DIRTY_OK;
+
+   uint64_t start, end;
+   if (!dirty_range_align(bo_size, offset, length, &start, &end))
+      return AGX_D3DKMT_DIRTY_INVALID;
+
+   dirty_next_epoch(state);
+   dirty_insert_aligned(state, start, end);
+   return AGX_D3DKMT_DIRTY_OK;
+}
+
+bool
+agx_d3dkmt_dirty_detach(struct agx_d3dkmt_dirty_state *state,
+                        struct agx_d3dkmt_dirty_snapshot *snapshot)
+{
+   if (state == NULL || snapshot == NULL ||
+       (!state->whole_bo && state->range_count == 0))
+      return false;
+
+   memset(snapshot, 0, sizeof(*snapshot));
+   snapshot->identity = state->identity;
+   snapshot->cpu_write_epoch = state->cpu_write_epoch;
+   snapshot->range_count = state->range_count;
+   snapshot->whole_bo = state->whole_bo;
+   memcpy(snapshot->ranges, state->ranges,
+          (size_t)state->range_count * sizeof(snapshot->ranges[0]));
+
+   state->range_count = 0;
+   state->whole_bo = false;
+   return true;
+}
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_restore(struct agx_d3dkmt_dirty_state *state,
+                         uint64_t bo_size,
+                         const struct agx_d3dkmt_dirty_snapshot *snapshot)
+{
+   if (state == NULL || snapshot == NULL || snapshot->identity == 0 ||
+       snapshot->range_count > AGX_D3DKMT_DIRTY_RANGES_PER_BO)
+      return AGX_D3DKMT_DIRTY_INVALID;
+   if (state->identity != snapshot->identity)
+      return AGX_D3DKMT_DIRTY_STALE;
+
+   if (snapshot->cpu_write_epoch > state->cpu_write_epoch)
+      state->cpu_write_epoch = snapshot->cpu_write_epoch;
+   if (snapshot->whole_bo) {
+      dirty_make_whole(state);
+      return AGX_D3DKMT_DIRTY_OK;
+   }
+
+   for (uint32_t i = 0; i < snapshot->range_count; i++) {
+      uint64_t start, end;
+      if (!dirty_range_align(bo_size, snapshot->ranges[i].offset,
+                             snapshot->ranges[i].length, &start, &end))
+         return AGX_D3DKMT_DIRTY_INVALID;
+      dirty_insert_aligned(state, start, end);
+   }
+   return AGX_D3DKMT_DIRTY_OK;
+}
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_commit(struct agx_d3dkmt_dirty_state *state,
+                        const struct agx_d3dkmt_dirty_snapshot *snapshot)
+{
+   if (state == NULL || snapshot == NULL || snapshot->identity == 0)
+      return AGX_D3DKMT_DIRTY_INVALID;
+   if (state->identity != snapshot->identity)
+      return AGX_D3DKMT_DIRTY_STALE;
+
+   if (snapshot->cpu_write_epoch > state->clean_epoch)
+      state->clean_epoch = snapshot->cpu_write_epoch;
+   return AGX_D3DKMT_DIRTY_OK;
+}
+
+bool
+agx_d3dkmt_dirty_has_pending(const struct agx_d3dkmt_dirty_state *state)
+{
+   return state != NULL && (state->whole_bo || state->range_count != 0);
+}
+
 /* -------------------------------------------------------------------------
  * Handle pool.
  * ------------------------------------------------------------------------- */

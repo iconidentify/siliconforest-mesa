@@ -339,7 +339,9 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
    if (p_atomic_read(&bo->refcnt) == 0) {
       assert(!p_atomic_read_relaxed(&bo->writer));
 
-      if (bo->_map != NULL ||
+      agx_bo_discard_cpu_dirty(bo);
+
+      if (dev->ops.bo_mark_cpu_dirty != NULL || bo->_map != NULL ||
           (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0)
          p_atomic_inc(&dev->read_set_generation);
 
@@ -432,8 +434,9 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
    }
 
    bo->label = label;
+   agx_bo_reset_cpu_dirty(bo);
    p_atomic_set(&bo->refcnt, 1);
-   if (bo->_map != NULL ||
+   if (dev->ops.bo_mark_cpu_dirty != NULL || bo->_map != NULL ||
        (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0)
       p_atomic_inc(&dev->read_set_generation);
 

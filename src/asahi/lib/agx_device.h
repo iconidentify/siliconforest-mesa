@@ -139,6 +139,12 @@ typedef struct {
    void (*bo_munmap)(struct agx_device *dev, struct agx_bo *bo);
    int (*bo_sync_for_device)(struct agx_device *dev, struct agx_bo *bo,
                              size_t offset, size_t size);
+   int (*bo_sync_for_cpu)(struct agx_device *dev, struct agx_bo *bo,
+                          size_t offset, size_t size);
+   void (*bo_mark_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo,
+                             size_t offset, size_t size, bool precise);
+   void (*bo_reset_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo);
+   void (*bo_discard_cpu_dirty)(struct agx_device *dev, struct agx_bo *bo);
    void (*bo_free)(struct agx_device *dev, uint32_t handle);
 } agx_device_ops_t;
 
@@ -234,12 +240,17 @@ struct agx_device {
    struct util_sparse_array bo_map;
    uint32_t max_handle;
 
-   /* Membership generation for the D3DKMT submit coherency read set.
-    * Persistent host-coherent mappings may be written between any two
-    * submits, so this is deliberately a membership generation, not a CPU
-    * dirty generation: every cached member is still published on every
-    * submit. */
+   /* Membership generation for the D3DKMT submission-retention set. Every
+    * live GPU VA is retained independently from the precise CPU-dirty set. */
    uint32_t read_set_generation;
+
+#ifdef _WIN32
+   /* Independent from bo_map_lock so a persistent-map write can publish an
+    * interval without serializing BO lookup. Submit takes bo_map_lock first,
+    * then this lock, which is also the lifetime-reset lock order. */
+   simple_mtx_t d3dkmt_dirty_lock;
+   uint64_t d3dkmt_next_bo_identity;
+#endif
 
    struct {
       simple_mtx_t lock;
@@ -287,6 +298,40 @@ agx_bo_sync_for_device(struct agx_bo *bo, size_t offset, size_t size)
    return bo->dev->ops.bo_sync_for_device(bo->dev, bo, offset, size);
 }
 
+static inline int
+agx_bo_sync_for_cpu(struct agx_bo *bo, size_t offset, size_t size)
+{
+   assert(bo != NULL && bo->dev != NULL);
+   assert(offset <= bo->size && size <= bo->size - offset);
+   return bo->dev->ops.bo_sync_for_cpu
+             ? bo->dev->ops.bo_sync_for_cpu(bo->dev, bo, offset, size)
+             : 0;
+}
+
+static inline void
+agx_bo_mark_cpu_dirty(struct agx_bo *bo, size_t offset, size_t size,
+                      bool precise)
+{
+   assert(bo != NULL && bo->dev != NULL);
+   assert(offset <= bo->size && size <= bo->size - offset);
+   if (bo->dev->ops.bo_mark_cpu_dirty)
+      bo->dev->ops.bo_mark_cpu_dirty(bo->dev, bo, offset, size, precise);
+}
+
+static inline void
+agx_bo_reset_cpu_dirty(struct agx_bo *bo)
+{
+   if (bo->dev->ops.bo_reset_cpu_dirty)
+      bo->dev->ops.bo_reset_cpu_dirty(bo->dev, bo);
+}
+
+static inline void
+agx_bo_discard_cpu_dirty(struct agx_bo *bo)
+{
+   if (bo->dev->ops.bo_discard_cpu_dirty)
+      bo->dev->ops.bo_discard_cpu_dirty(bo->dev, bo);
+}
+
 /*
  * Determine if an address is in the read-only section. See the documentation
  * for sparse_ro_offset.
@@ -313,8 +358,13 @@ agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr)
 {
    if (!bo->_map) {
       bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr);
-      if (bo->_map)
+      if (bo->_map) {
          p_atomic_inc(&bo->dev->read_set_generation);
+         /* A raw persistent pointer has no later write callback. Keep the BO
+          * conservative for its mapped lifetime; HOST_COHERENT memory may be
+          * written again without a Vulkan Flush callback. */
+         agx_bo_mark_cpu_dirty(bo, 0, bo->size, false);
+      }
    }
 
    return bo->_map;

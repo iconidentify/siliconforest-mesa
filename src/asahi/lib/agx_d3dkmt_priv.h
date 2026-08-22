@@ -31,8 +31,14 @@
 #define AGX_D3DKMT_STAGING_RING 2
 
 struct agx_d3dkmt_submit_blob {
-   struct agxw_submit_private_v3 header;
-   struct agxw_submit_read_range ranges[AGXW_MAX_READ_RANGES_PER_SUBMIT];
+   struct agxw_submit_private_v5 header;
+   struct agxw_submit_read_range ranges[2 * AGXW_MAX_READ_RANGES_PER_SUBMIT];
+};
+
+struct agx_d3dkmt_bo_snapshot {
+   uint32_t handle;
+   uint64_t bo_size;
+   struct agx_d3dkmt_dirty_snapshot dirty;
 };
 
 struct agx_d3dkmt_ctx {
@@ -52,6 +58,9 @@ struct agx_d3dkmt_ctx {
    uint64_t staging_retire[AGX_D3DKMT_STAGING_RING];
    unsigned staging_slot;
    struct agx_d3dkmt_submit_blob *submit_blob;
+   struct agx_d3dkmt_bo_snapshot *dirty_snapshots;
+   uint32_t dirty_snapshot_count;
+   uint32_t dirty_snapshot_capacity;
 };
 
 #if AGX_GPU_DIAG >= 2
@@ -125,6 +134,13 @@ struct agx_d3dkmt_winsys {
    uint32_t read_set_count;
    uint32_t read_set_generation;
    bool read_set_valid;
+
+   uint64_t dirty_submit_count;
+   uint64_t dirty_unchanged_submits;
+   uint64_t dirty_precise_bytes;
+   uint64_t dirty_conservative_bytes;
+   uint64_t dirty_clean_vector_fallbacks;
+   uint64_t dirty_stale_snapshots;
 
    /* Lazily created SynchronizationOnly context used to implement DRM
     * syncobj transfer as a GPU-side wait-then-signal. */

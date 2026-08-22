@@ -730,6 +730,18 @@ VKAPI_ATTR VkResult VKAPI_CALL
 hk_FlushMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
                            const VkMappedMemoryRange *pMemoryRanges)
 {
+   VK_FROM_HANDLE(hk_device, dev, device);
+
+   for (uint32_t i = 0; i < memoryRangeCount; i++) {
+      const VkMappedMemoryRange *range = &pMemoryRanges[i];
+      VK_FROM_HANDLE(hk_device_memory, mem, range->memory);
+      const VkDeviceSize size =
+         vk_device_memory_range(&mem->vk, range->offset, range->size);
+
+      if (size != 0 &&
+          agx_bo_sync_for_device(mem->bo, range->offset, size) != 0)
+         return vk_device_set_lost(&dev->vk, "memory flush failed");
+   }
    return VK_SUCCESS;
 }
 
@@ -737,6 +749,17 @@ VKAPI_ATTR VkResult VKAPI_CALL
 hk_InvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
                                 const VkMappedMemoryRange *pMemoryRanges)
 {
+   VK_FROM_HANDLE(hk_device, dev, device);
+
+   for (uint32_t i = 0; i < memoryRangeCount; i++) {
+      const VkMappedMemoryRange *range = &pMemoryRanges[i];
+      VK_FROM_HANDLE(hk_device_memory, mem, range->memory);
+      const VkDeviceSize size =
+         vk_device_memory_range(&mem->vk, range->offset, range->size);
+
+      if (size != 0 && agx_bo_sync_for_cpu(mem->bo, range->offset, size) != 0)
+         return vk_device_set_lost(&dev->vk, "memory invalidate failed");
+   }
    return VK_SUCCESS;
 }
 

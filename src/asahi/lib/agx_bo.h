@@ -12,6 +12,10 @@
 #include <time.h>
 #include "util/list.h"
 
+#ifdef _WIN32
+#include "agx_d3dkmt_core.h"
+#endif
+
 struct agx_device;
 
 enum agx_bo_flags {
@@ -69,6 +73,16 @@ struct agx_ptr {
    uint64_t gpu;
 };
 
+#ifdef _WIN32
+enum agx_d3dkmt_bo_origin {
+   AGX_D3DKMT_BO_PRIVATE = 0,
+   AGX_D3DKMT_BO_CREATED_SHAREABLE,
+   AGX_D3DKMT_BO_IMPORTED_EXTERNAL,
+   AGX_D3DKMT_BO_IMPORTED_LOCAL,
+   AGX_D3DKMT_BO_EXPORTED,
+};
+#endif
+
 struct agx_bo {
    /* Must be first for casting */
    struct list_head bucket_link;
@@ -112,6 +126,15 @@ struct agx_bo {
 
    /* For debugging */
    const char *label;
+
+#ifdef _WIN32
+   /* D3DKMT cache ownership is tracked per logical BO lifetime. A cached BO
+    * receives a new identity before reuse so an older failed submit cannot
+    * restore dirty intervals into the new owner. */
+   struct agx_d3dkmt_dirty_state d3dkmt_dirty;
+   enum agx_d3dkmt_bo_origin d3dkmt_origin;
+   bool d3dkmt_conservative_dirty;
+#endif
 };
 
 static inline uint32_t

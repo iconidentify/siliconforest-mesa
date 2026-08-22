@@ -508,6 +508,63 @@ int agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                               uint32_t *count, uint32_t capacity,
                               uint64_t gpu_va, uint64_t length);
 
+/* A BO normally has only one or two independently updated CPU regions. Keep
+ * those intervals exact and bounded. If a pathological writer produces more,
+ * the state falls back to the current BO lifetime's whole range. */
+#define AGX_D3DKMT_DIRTY_RANGES_PER_BO 8u
+
+struct agx_d3dkmt_dirty_range {
+   uint64_t offset;
+   uint64_t length;
+};
+
+struct agx_d3dkmt_dirty_state {
+   uint64_t identity;
+   uint64_t cpu_write_epoch;
+   uint64_t clean_epoch;
+   uint32_t range_count;
+   bool whole_bo;
+   struct agx_d3dkmt_dirty_range
+      ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO];
+};
+
+struct agx_d3dkmt_dirty_snapshot {
+   uint64_t identity;
+   uint64_t cpu_write_epoch;
+   uint32_t range_count;
+   bool whole_bo;
+   struct agx_d3dkmt_dirty_range
+      ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO];
+};
+
+enum agx_d3dkmt_dirty_result {
+   AGX_D3DKMT_DIRTY_OK = 0,
+   AGX_D3DKMT_DIRTY_STALE = 1,
+   AGX_D3DKMT_DIRTY_INVALID = 2,
+};
+
+void agx_d3dkmt_dirty_reset(struct agx_d3dkmt_dirty_state *state,
+                            uint64_t identity);
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_mark(struct agx_d3dkmt_dirty_state *state,
+                      uint64_t bo_size, uint64_t offset, uint64_t length);
+
+bool agx_d3dkmt_dirty_detach(struct agx_d3dkmt_dirty_state *state,
+                             struct agx_d3dkmt_dirty_snapshot *snapshot);
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_restore(struct agx_d3dkmt_dirty_state *state,
+                         uint64_t bo_size,
+                         const struct agx_d3dkmt_dirty_snapshot *snapshot);
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_commit(struct agx_d3dkmt_dirty_state *state,
+                        const struct agx_d3dkmt_dirty_snapshot *snapshot);
+
+bool agx_d3dkmt_dirty_has_pending(
+   const struct agx_d3dkmt_dirty_state *state);
+
 #ifdef __cplusplus
 }
 #endif
