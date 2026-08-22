@@ -69,6 +69,63 @@ agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
    return AGX_D3DKMT_OK;
 }
 
+int
+agx_d3dkmt_read_ranges_compact(struct agxw_submit_read_range *ranges,
+                               uint32_t *count, uint32_t capacity,
+                               uint64_t *bridged_bytes)
+{
+   if (ranges == NULL || count == NULL || (*count != 0 && capacity == 0))
+      return AGX_D3DKMT_ERR_INVAL;
+
+   uint64_t bridged = 0;
+   for (uint32_t i = 0; i < *count; i++) {
+      if (ranges[i].length == 0 ||
+          ranges[i].gpu_va > UINT64_MAX - ranges[i].length ||
+          !agxw_va_range_is_user(ranges[i].gpu_va, ranges[i].length) ||
+          (i != 0 && ranges[i - 1].gpu_va + ranges[i - 1].length >
+                         ranges[i].gpu_va))
+         return AGX_D3DKMT_ERR_INVAL;
+   }
+
+   while (*count > capacity) {
+      uint32_t best = UINT32_MAX;
+      uint64_t best_gap = UINT64_MAX;
+
+      for (uint32_t i = 0; i + 1 < *count; i++) {
+         const uint64_t end = ranges[i].gpu_va + ranges[i].length;
+         const uint64_t next_end =
+            ranges[i + 1].gpu_va + ranges[i + 1].length;
+         const uint64_t gap = ranges[i + 1].gpu_va - end;
+         const uint64_t merged_length = next_end - ranges[i].gpu_va;
+
+         if (!agxw_va_range_is_user(ranges[i].gpu_va, merged_length))
+            continue;
+         if (best == UINT32_MAX || gap < best_gap) {
+            best = i;
+            best_gap = gap;
+         }
+      }
+
+      if (best == UINT32_MAX)
+         return AGX_D3DKMT_ERR_NOSPACE;
+
+      const uint64_t merged_end =
+         ranges[best + 1].gpu_va + ranges[best + 1].length;
+      ranges[best].length = merged_end - ranges[best].gpu_va;
+      memmove(&ranges[best + 1], &ranges[best + 2],
+              (size_t)(*count - best - 2) * sizeof(*ranges));
+      (*count)--;
+      if (UINT64_MAX - bridged < best_gap)
+         bridged = UINT64_MAX;
+      else
+         bridged += best_gap;
+   }
+
+   if (bridged_bytes != NULL)
+      *bridged_bytes = bridged;
+   return AGX_D3DKMT_OK;
+}
+
 static bool
 dirty_range_align(uint64_t bo_size, uint64_t offset, uint64_t length,
                   uint64_t *start, uint64_t *end)
@@ -175,6 +232,16 @@ agx_d3dkmt_dirty_reset(struct agx_d3dkmt_dirty_state *state,
    state->identity = identity;
 }
 
+void
+agx_d3dkmt_dirty_reset_mapped(struct agx_d3dkmt_dirty_state *state,
+                              uint64_t identity, uint64_t bo_size,
+                              bool mapped)
+{
+   agx_d3dkmt_dirty_reset(state, identity);
+   if (mapped)
+      (void)agx_d3dkmt_dirty_mark_whole(state, bo_size);
+}
+
 enum agx_d3dkmt_dirty_result
 agx_d3dkmt_dirty_mark(struct agx_d3dkmt_dirty_state *state, uint64_t bo_size,
                       uint64_t offset, uint64_t length)
@@ -191,6 +258,19 @@ agx_d3dkmt_dirty_mark(struct agx_d3dkmt_dirty_state *state, uint64_t bo_size,
 
    dirty_next_epoch(state);
    dirty_insert_aligned(state, start, end);
+   return AGX_D3DKMT_DIRTY_OK;
+}
+
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_mark_whole(struct agx_d3dkmt_dirty_state *state,
+                            uint64_t bo_size)
+{
+   if (state == NULL || state->identity == 0 || bo_size == 0 ||
+       (bo_size & (AGX_D3DKMT_PAGE_SIZE - 1)) != 0)
+      return AGX_D3DKMT_DIRTY_INVALID;
+
+   dirty_next_epoch(state);
+   dirty_make_whole(state);
    return AGX_D3DKMT_DIRTY_OK;
 }
 

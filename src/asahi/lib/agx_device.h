@@ -249,6 +249,10 @@ struct agx_device {
     * interval without serializing BO lookup. Submit takes bo_map_lock first,
     * then this lock, which is also the lifetime-reset lock order. */
    simple_mtx_t d3dkmt_dirty_lock;
+   /* Serializes detaching CPU-dirty ownership through SubmitCommand's accept
+    * result. Without this gate a second context could observe an empty clean
+    * set while the first context temporarily owned the only dirty snapshot. */
+   simple_mtx_t d3dkmt_submit_clean_lock;
    uint64_t d3dkmt_next_bo_identity;
 #endif
 

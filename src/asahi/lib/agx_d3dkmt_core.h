@@ -508,6 +508,14 @@ int agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                               uint32_t *count, uint32_t capacity,
                               uint64_t gpu_va, uint64_t length);
 
+/* Reduce a canonical range census without dropping coverage. The smallest
+ * legal gaps are bridged first; KMD advisory walkers skip unmapped pages, so
+ * ordinary 64 KiB VA guards cost only their page walks. A gap which crosses
+ * the protected kernel carveout is never eligible. */
+int agx_d3dkmt_read_ranges_compact(struct agxw_submit_read_range *ranges,
+                                   uint32_t *count, uint32_t capacity,
+                                   uint64_t *bridged_bytes);
+
 /* A BO normally has only one or two independently updated CPU regions. Keep
  * those intervals exact and bounded. If a pathological writer produces more,
  * the state falls back to the current BO lifetime's whole range. */
@@ -545,10 +553,16 @@ enum agx_d3dkmt_dirty_result {
 
 void agx_d3dkmt_dirty_reset(struct agx_d3dkmt_dirty_state *state,
                             uint64_t identity);
+void agx_d3dkmt_dirty_reset_mapped(struct agx_d3dkmt_dirty_state *state,
+                                   uint64_t identity, uint64_t bo_size,
+                                   bool mapped);
 
 enum agx_d3dkmt_dirty_result
 agx_d3dkmt_dirty_mark(struct agx_d3dkmt_dirty_state *state,
                       uint64_t bo_size, uint64_t offset, uint64_t length);
+enum agx_d3dkmt_dirty_result
+agx_d3dkmt_dirty_mark_whole(struct agx_d3dkmt_dirty_state *state,
+                            uint64_t bo_size);
 
 bool agx_d3dkmt_dirty_detach(struct agx_d3dkmt_dirty_state *state,
                              struct agx_d3dkmt_dirty_snapshot *snapshot);

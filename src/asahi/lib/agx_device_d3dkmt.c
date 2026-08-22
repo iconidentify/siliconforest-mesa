@@ -1513,10 +1513,13 @@ d3dkmt_bo_mark_cpu_dirty(struct agx_device *dev, struct agx_bo *bo,
 
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
    if (bo->d3dkmt_dirty.identity != 0) {
-      if (!precise)
+      if (!precise) {
          bo->d3dkmt_conservative_dirty = true;
-
-      (void)agx_d3dkmt_dirty_mark(&bo->d3dkmt_dirty, bo->size, offset, size);
+         (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+      } else {
+         (void)agx_d3dkmt_dirty_mark(&bo->d3dkmt_dirty, bo->size, offset,
+                                     size);
+      }
    }
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
@@ -1534,12 +1537,16 @@ static void
 d3dkmt_bo_reset_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
 {
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
-   agx_d3dkmt_dirty_reset(&bo->d3dkmt_dirty,
-                          d3dkmt_next_bo_identity(dev));
+   agx_d3dkmt_dirty_reset_mapped(&bo->d3dkmt_dirty,
+                                 d3dkmt_next_bo_identity(dev), bo->size,
+                                 bo->_map != NULL);
    bo->d3dkmt_origin = (bo->flags & AGX_BO_SHAREABLE)
                           ? AGX_D3DKMT_BO_CREATED_SHAREABLE
                           : AGX_D3DKMT_BO_PRIVATE;
-   bo->d3dkmt_conservative_dirty = false;
+   /* The BO cache preserves a Lock2 mapping across logical lifetimes. Reset
+    * runs before refcnt publication, so re-establish the mapped lifetime's
+    * whole-BO ownership atomically with its new identity. */
+   bo->d3dkmt_conservative_dirty = bo->_map != NULL;
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1562,18 +1569,34 @@ d3dkmt_bo_discard_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
 static int
 d3dkmt_reserve_dirty_snapshots(struct agx_d3dkmt_ctx *ctx, uint32_t capacity)
 {
-   if (capacity <= ctx->dirty_snapshot_capacity)
+   if (capacity <= ctx->dirty_snapshot_capacity &&
+       capacity <= ctx->read_candidate_capacity)
       return 0;
 
-   struct agx_d3dkmt_bo_snapshot *snapshots =
-      realloc(ctx->dirty_snapshots, (size_t)capacity * sizeof(*snapshots));
-   if (snapshots == NULL) {
-      errno = ENOMEM;
-      return -1;
+   if (capacity > ctx->dirty_snapshot_capacity) {
+      struct agx_d3dkmt_bo_snapshot *snapshots =
+         realloc(ctx->dirty_snapshots, (size_t)capacity * sizeof(*snapshots));
+      if (snapshots == NULL) {
+         errno = ENOMEM;
+         return -1;
+      }
+
+      ctx->dirty_snapshots = snapshots;
+      ctx->dirty_snapshot_capacity = capacity;
    }
 
-   ctx->dirty_snapshots = snapshots;
-   ctx->dirty_snapshot_capacity = capacity;
+   if (capacity > ctx->read_candidate_capacity) {
+      struct agxw_submit_read_range *candidates =
+         realloc(ctx->read_candidates,
+                 (size_t)capacity * sizeof(*candidates));
+      if (candidates == NULL) {
+         errno = ENOMEM;
+         return -1;
+      }
+
+      ctx->read_candidates = candidates;
+      ctx->read_candidate_capacity = capacity;
+   }
    return 0;
 }
 
@@ -1586,6 +1609,8 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
 {
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
    uint32_t generation;
+   uint64_t compacted_gap_bytes = 0;
+   bool read_set_compacted = false;
 
    /* max_handle may grow between this read and taking bo_map_lock. Retry
     * rather than allocating while both BO locks are held. */
@@ -1595,7 +1620,8 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
          return -1;
 
       simple_mtx_lock(&dev->bo_map_lock);
-      if (ctx->dirty_snapshot_capacity >= dev->max_handle)
+      if (ctx->dirty_snapshot_capacity >= dev->max_handle &&
+          ctx->read_candidate_capacity >= dev->max_handle)
          break;
       simple_mtx_unlock(&dev->bo_map_lock);
    }
@@ -1610,13 +1636,27 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
          if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0)
             continue;
          if (agx_d3dkmt_read_range_add(
-                ws->read_set, &count, AGXW_MAX_READ_RANGES_PER_SUBMIT,
+                ctx->read_candidates, &count,
+                ctx->read_candidate_capacity,
                 bo->va->addr, bo->size) != AGX_D3DKMT_OK) {
             simple_mtx_unlock(&dev->bo_map_lock);
             errno = ENOSPC;
             return -1;
          }
       }
+      if (count > AGXW_MAX_READ_RANGES_PER_SUBMIT) {
+         if (agx_d3dkmt_read_ranges_compact(
+                ctx->read_candidates, &count,
+                AGXW_MAX_READ_RANGES_PER_SUBMIT,
+                &compacted_gap_bytes) != AGX_D3DKMT_OK) {
+            simple_mtx_unlock(&dev->bo_map_lock);
+            errno = ENOSPC;
+            return -1;
+         }
+         read_set_compacted = true;
+      }
+      memcpy(ws->read_set, ctx->read_candidates,
+             (size_t)count * sizeof(*ws->read_set));
       ws->read_set_count = count;
       ws->read_set_generation = generation;
       ws->read_set_valid = true;
@@ -1641,8 +1681,7 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
          bo->d3dkmt_origin == AGX_D3DKMT_BO_IMPORTED_EXTERNAL ||
          bo->d3dkmt_origin == AGX_D3DKMT_BO_EXPORTED;
       if (conservative)
-         (void)agx_d3dkmt_dirty_mark(&bo->d3dkmt_dirty, bo->size, 0,
-                                     bo->size);
+         (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
 
       struct agx_d3dkmt_bo_snapshot *entry =
          &ctx->dirty_snapshots[ctx->dirty_snapshot_count];
@@ -1692,6 +1731,10 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
    ws->dirty_conservative_bytes += conservative_bytes;
    if (clean_fallback)
       ws->dirty_clean_vector_fallbacks++;
+   if (read_set_compacted) {
+      ws->read_set_compactions++;
+      ws->read_set_compacted_gap_bytes += compacted_gap_bytes;
+   }
    simple_mtx_unlock(&ws->lock);
    return 0;
 }
@@ -1951,6 +1994,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    uint32_t priv_size = 0;
    int ret = -1;
    bool command_submitted = false;
+   bool clean_lock_held = false;
 #if AGX_GPU_DIAG >= 2
    uint32_t diag_slot = 0;
    uint64_t diag_sequence = 0;
@@ -2033,38 +2077,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
           (size_t)sizeof(struct agxw_dma_header) + submit->cmdbuf_size))
       goto out;
 
-   memset(ctx->submit_blob, 0, sizeof(ctx->submit_blob->header));
-   priv = &ctx->submit_blob->header;
-   struct agxw_submit_read_range *read_ranges =
-      ctx->submit_blob->ranges;
-   struct agxw_submit_read_range *clean_ranges =
-      &ctx->submit_blob->ranges[AGXW_MAX_READ_RANGES_PER_SUBMIT];
-   if (d3dkmt_build_submit_sets(
-          dev, ctx, read_ranges, &priv->read_range_count, clean_ranges,
-          &priv->clean_range_count) != 0)
-      goto out;
-
-   /* The ABI vectors are tightly packed even though the scratch clean vector
-    * starts at a fixed offset to make independent overflow handling simple. */
-   memmove(read_ranges + priv->read_range_count, clean_ranges,
-           (size_t)priv->clean_range_count * sizeof(*clean_ranges));
-   priv->base.version = AGXW_SUBMIT_PRIVATE_VERSION_V5;
-   priv->base.struct_size = sizeof(*priv);
-   priv->base.in_sync_count = 0;
-   priv->base.out_sync_count = 0;
-   priv->base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
-      AGXW_SUBMIT_CLEAN_SET_COMPLETE |
-      ((submit->flags & AGX_SUBMIT_WRITE_SET_COMPLETE)
-          ? AGXW_SUBMIT_WRITE_SET_COMPLETE : 0);
-   priv_size = (uint32_t)sizeof(*priv) +
-      (priv->read_range_count + priv->clean_range_count) *
-         sizeof(*read_ranges);
-   if (agxw_submit_private_validate(&priv->base, priv_size) != 0) {
-      errno = EINVAL;
-      goto out;
-   }
-
-   /* Resolve every syncobj handle before the first D3DKMT call. */
+   /* Resolve handles and reserve fence values before serializing CPU-dirty
+    * ownership. Only the build-to-SubmitCommand accept window needs the
+    * device-wide gate. */
    uint32_t n_sig = 0;
    uint64_t retire;
 
@@ -2131,6 +2146,39 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 #endif
    simple_mtx_unlock(&ws->lock);
 
+   simple_mtx_lock(&dev->d3dkmt_submit_clean_lock);
+   clean_lock_held = true;
+   memset(ctx->submit_blob, 0, sizeof(ctx->submit_blob->header));
+   priv = &ctx->submit_blob->header;
+   struct agxw_submit_read_range *read_ranges =
+      ctx->submit_blob->ranges;
+   struct agxw_submit_read_range *clean_ranges =
+      &ctx->submit_blob->ranges[AGXW_MAX_READ_RANGES_PER_SUBMIT];
+   if (d3dkmt_build_submit_sets(
+          dev, ctx, read_ranges, &priv->read_range_count, clean_ranges,
+          &priv->clean_range_count) != 0)
+      goto out;
+
+   /* The ABI vectors are tightly packed even though the scratch clean vector
+    * starts at a fixed offset to make independent overflow handling simple. */
+   memmove(read_ranges + priv->read_range_count, clean_ranges,
+           (size_t)priv->clean_range_count * sizeof(*clean_ranges));
+   priv->base.version = AGXW_SUBMIT_PRIVATE_VERSION_V5;
+   priv->base.struct_size = sizeof(*priv);
+   priv->base.in_sync_count = 0;
+   priv->base.out_sync_count = 0;
+   priv->base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
+      AGXW_SUBMIT_CLEAN_SET_COMPLETE |
+      ((submit->flags & AGX_SUBMIT_WRITE_SET_COMPLETE)
+          ? AGXW_SUBMIT_WRITE_SET_COMPLETE : 0);
+   priv_size = (uint32_t)sizeof(*priv) +
+      (priv->read_range_count + priv->clean_range_count) *
+         sizeof(*read_ranges);
+   if (agxw_submit_private_validate(&priv->base, priv_size) != 0) {
+      errno = EINVAL;
+      goto out;
+   }
+
    if (n_in > 0) {
       struct agx_kmt_waitsyncfromgpu wait = {
          .hContext = ctx->hContext,
@@ -2169,6 +2217,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       goto out;
    }
    command_submitted = true;
+   d3dkmt_finish_dirty_snapshots(dev, ctx, true);
+   simple_mtx_unlock(&dev->d3dkmt_submit_clean_lock);
+   clean_lock_held = false;
 #if AGX_GPU_DIAG >= 2
    simple_mtx_lock(&ws->lock);
    if (ws->diag_submits[diag_slot].sequence == diag_sequence)
@@ -2204,7 +2255,10 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    ret = 0;
 
 out:
-   d3dkmt_finish_dirty_snapshots(dev, ctx, command_submitted);
+   if (clean_lock_held) {
+      d3dkmt_finish_dirty_snapshots(dev, ctx, command_submitted);
+      simple_mtx_unlock(&dev->d3dkmt_submit_clean_lock);
+   }
    simple_mtx_lock(&ws->lock);
    assert(ctx->submit_refs == 1 && ws->active_submits > 0);
    ctx->submit_refs = 0;
@@ -2705,6 +2759,7 @@ d3dkmt_queue_destroy(struct agx_device *dev, struct drm_asahi_queue_destroy *q)
    agx_kmt_status sync_status = ws->fns.DestroySynchronizationObject(&d);
    free(local.submit_blob);
    free(local.dirty_snapshots);
+   free(local.read_candidates);
    if (agxw_bridge_is_sentinel(ws->device))
       agx_bridge_valog(
          "QUEUE winsys-destroy provider_slot=%u stage=complete queue=%u "
@@ -3075,6 +3130,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    dev->ops = agx_device_d3dkmt_ops;
    dev->write_set_contract = true;
    simple_mtx_init(&dev->d3dkmt_dirty_lock, mtx_plain);
+   simple_mtx_init(&dev->d3dkmt_submit_clean_lock, mtx_plain);
    dev->d3dkmt_next_bo_identity = 0;
    if (enum_log_enabled())
       fprintf(stderr, "NTAGX_ENUM open_device=ready\n");
@@ -3133,6 +3189,7 @@ agx_d3dkmt_close_device(struct agx_device *dev)
       ws->fns.DestroySynchronizationObject(&ds);
       free(ws->ctxs[i].submit_blob);
       free(ws->ctxs[i].dirty_snapshots);
+      free(ws->ctxs[i].read_candidates);
    }
    free(ws->ctxs);
 
@@ -3164,13 +3221,17 @@ agx_d3dkmt_close_device(struct agx_device *dev)
    if (enum_log_enabled())
       fprintf(stderr,
               "NTAGX_DIRTY submits=%llu unchanged=%llu precise_bytes=%llu "
-              "conservative_bytes=%llu clean_fallbacks=%llu stale=%llu\n",
+              "conservative_bytes=%llu clean_fallbacks=%llu stale=%llu "
+              "read_compactions=%llu gap_bytes=%llu\n",
               (unsigned long long)ws->dirty_submit_count,
               (unsigned long long)ws->dirty_unchanged_submits,
               (unsigned long long)ws->dirty_precise_bytes,
               (unsigned long long)ws->dirty_conservative_bytes,
               (unsigned long long)ws->dirty_clean_vector_fallbacks,
-              (unsigned long long)ws->dirty_stale_snapshots);
+              (unsigned long long)ws->dirty_stale_snapshots,
+              (unsigned long long)ws->read_set_compactions,
+              (unsigned long long)ws->read_set_compacted_gap_bytes);
+   simple_mtx_destroy(&dev->d3dkmt_submit_clean_lock);
    simple_mtx_destroy(&dev->d3dkmt_dirty_lock);
    simple_mtx_destroy(&ws->lock);
    free(ws->params);

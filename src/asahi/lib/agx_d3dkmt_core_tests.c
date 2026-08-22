@@ -1104,6 +1104,70 @@ test_read_range_canonicalization(void)
 }
 
 static void
+test_read_range_compaction(void)
+{
+   enum { RANGE_COUNT = 300, CAPACITY = 256 };
+   struct agxw_submit_read_range ranges[RANGE_COUNT] = {0};
+   const uint64_t base = UINT64_C(0x1800000000);
+   const uint64_t stride = UINT64_C(0x14000);
+   uint32_t count = 0;
+   uint64_t bridged = 0;
+
+   for (uint32_t i = 0; i < RANGE_COUNT; i++) {
+      CHECK_EQ(agx_d3dkmt_read_range_add(
+                  ranges, &count, RANGE_COUNT,
+                  base + (uint64_t)i * stride, AGX_D3DKMT_PAGE_SIZE),
+               AGX_D3DKMT_OK);
+   }
+   CHECK_EQ(count, RANGE_COUNT);
+   CHECK_EQ(agx_d3dkmt_read_ranges_compact(
+               ranges, &count, CAPACITY, &bridged),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(count, CAPACITY);
+   CHECK_EQ(bridged,
+            (uint64_t)(RANGE_COUNT - CAPACITY) *
+               (stride - AGX_D3DKMT_PAGE_SIZE));
+
+   /* Compaction may cover guards but may not omit one byte of an input BO. */
+   uint32_t output = 0;
+   for (uint32_t input = 0; input < RANGE_COUNT; input++) {
+      const uint64_t start = base + (uint64_t)input * stride;
+      const uint64_t end = start + AGX_D3DKMT_PAGE_SIZE;
+      while (output + 1 < count &&
+             ranges[output].gpu_va + ranges[output].length <= start)
+         output++;
+      CHECK(ranges[output].gpu_va <= start);
+      CHECK(ranges[output].gpu_va + ranges[output].length >= end);
+   }
+
+   /* The protected carveout divides the user window into two legal spans.
+    * Even when its numerical gap is smallest, it is never bridgeable. */
+   struct agxw_submit_read_range split[4] = {
+      {AGXW_VM_KERNEL_CARVEOUT_BASE - UINT64_C(0x10000),
+       AGX_D3DKMT_PAGE_SIZE},
+      {AGXW_VM_KERNEL_CARVEOUT_BASE - UINT64_C(0x8000),
+       AGX_D3DKMT_PAGE_SIZE},
+      {AGXW_VM_KERNEL_CARVEOUT_BASE + AGXW_VM_KERNEL_CARVEOUT_SIZE,
+       AGX_D3DKMT_PAGE_SIZE},
+      {AGXW_VM_KERNEL_CARVEOUT_BASE + AGXW_VM_KERNEL_CARVEOUT_SIZE +
+          UINT64_C(0x8000),
+       AGX_D3DKMT_PAGE_SIZE},
+   };
+   count = 4;
+   bridged = 0;
+   CHECK_EQ(agx_d3dkmt_read_ranges_compact(split, &count, 2, &bridged),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(count, 2);
+   CHECK_EQ(bridged, UINT64_C(0x8000));
+   CHECK(agxw_va_range_is_user(split[0].gpu_va, split[0].length));
+   CHECK(agxw_va_range_is_user(split[1].gpu_va, split[1].length));
+   CHECK(split[0].gpu_va + split[0].length <=
+         AGXW_VM_KERNEL_CARVEOUT_BASE);
+   CHECK(split[1].gpu_va >=
+         AGXW_VM_KERNEL_CARVEOUT_BASE + AGXW_VM_KERNEL_CARVEOUT_SIZE);
+}
+
+static void
 test_dirty_interval_merge_and_overflow(void)
 {
    const uint64_t bo_size = 0x50000;
@@ -1176,6 +1240,29 @@ test_dirty_repeated_unchanged_submit(void)
             AGX_D3DKMT_DIRTY_OK);
    CHECK_EQ(state.clean_epoch, snapshot.cpu_write_epoch);
    CHECK(!agx_d3dkmt_dirty_detach(&state, &snapshot));
+}
+
+static void
+test_dirty_cached_mapping_reuse(void)
+{
+   struct agx_d3dkmt_dirty_state state;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+
+   agx_d3dkmt_dirty_reset_mapped(&state, 801, 0x20000, false);
+   CHECK(!agx_d3dkmt_dirty_has_pending(&state));
+
+   /* The cache keeps Lock2's pointer while changing logical BO identity.
+    * Reuse must publish the entire new mapped lifetime before refcnt becomes
+    * visible, even when no new mmap callback will occur. */
+   agx_d3dkmt_dirty_reset_mapped(&state, 802, 0x20000, true);
+   CHECK(agx_d3dkmt_dirty_has_pending(&state));
+   CHECK(agx_d3dkmt_dirty_detach(&state, &snapshot));
+   CHECK_EQ(snapshot.identity, 802);
+   CHECK(snapshot.whole_bo);
+   CHECK_EQ(snapshot.range_count, 0);
+   CHECK_EQ(agx_d3dkmt_dirty_commit(&state, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(!agx_d3dkmt_dirty_has_pending(&state));
 }
 
 static void
@@ -1315,9 +1402,11 @@ main(void)
    test_identity_parsing();
    test_alloc_flags();
    test_read_range_canonicalization();
+   test_read_range_compaction();
    test_dirty_interval_merge_and_overflow();
    test_dirty_detach_restore_and_stale_identity();
    test_dirty_repeated_unchanged_submit();
+   test_dirty_cached_mapping_reuse();
    test_invalidate_does_not_publish_a_flush();
    test_contract_blobs_we_emit();
 

@@ -61,6 +61,8 @@ struct agx_d3dkmt_ctx {
    struct agx_d3dkmt_bo_snapshot *dirty_snapshots;
    uint32_t dirty_snapshot_count;
    uint32_t dirty_snapshot_capacity;
+   struct agxw_submit_read_range *read_candidates;
+   uint32_t read_candidate_capacity;
 };
 
 #if AGX_GPU_DIAG >= 2
@@ -141,6 +143,8 @@ struct agx_d3dkmt_winsys {
    uint64_t dirty_conservative_bytes;
    uint64_t dirty_clean_vector_fallbacks;
    uint64_t dirty_stale_snapshots;
+   uint64_t read_set_compactions;
+   uint64_t read_set_compacted_gap_bytes;
 
    /* Lazily created SynchronizationOnly context used to implement DRM
     * syncobj transfer as a GPU-side wait-then-signal. */
