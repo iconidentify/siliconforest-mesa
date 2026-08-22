@@ -10,7 +10,15 @@
 #include "hk_physical_device.h"
 
 #include "asahi/lib/agx_bo.h"
+/* BUILD-STATUS.md stage-2: this include is unused in this file (no
+ * mmap / munmap / PROT_ / MAP_ constant reference anywhere below,
+ * VERIFIED by grep) -- mingw provides no <sys/mman.h> at all. Not
+ * Windows-specific dead code, just dead code that happens to only break
+ * the cross build.
+ */
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 static VkResult
 hk_descriptor_table_grow_locked(struct hk_device *dev,

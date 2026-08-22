@@ -135,6 +135,7 @@ struct hk_descriptor_state {
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
    uint32_t push_dirty;
+   uint32_t push_active;
 };
 
 struct hk_attachment {
@@ -322,6 +323,33 @@ struct agx_timestamp_req {
    uint32_t offset_B;
 };
 
+#define HK_CS_MAX_ATTACHMENTS 16
+
+struct hk_cs_attachment {
+   uint64_t pointer;
+   uint64_t size;
+};
+
+enum hk_cs_write_pipe {
+   HK_CS_WRITE_VERTEX,
+   HK_CS_WRITE_FRAGMENT,
+   HK_CS_WRITE_COMPUTE,
+};
+
+struct hk_cs_write_tracker {
+   /* Values baked into the command buffer (push descriptors, render targets,
+    * XFB). */
+   struct hk_cs_attachment attachments[HK_CS_MAX_ATTACHMENTS];
+   uint32_t attachment_count;
+
+   /* Ordinary descriptor sets are inspected at queue submit so a legal host
+    * update made after command recording is reflected in the write set. */
+   struct hk_descriptor_set *sets[HK_CS_MAX_ATTACHMENTS];
+   uint32_t set_count;
+
+   bool incomplete;
+};
+
 /*
  * hk_cs represents a single control stream, to be enqueued either to the
  * CDM or VDM for compute/3D respectively.
@@ -384,6 +412,12 @@ struct hk_cs {
       uint32_t calls, cmds, flushes, merged;
    } stats;
 
+   /* Exact GPU write ownership, split by hardware pipe to match the UAPI. */
+   struct hk_cs_write_tracker vertex_writes;
+   struct hk_cs_write_tracker fragment_writes;
+   struct hk_cs_write_tracker compute_writes;
+   bool writes_occlusion_queries;
+
    /* Timestamp writes. Currently just compute end / fragment end. We could
     * flesh this out later if we want finer info. (We will, but it's not
     * required for conformance.)
@@ -437,6 +471,38 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
    a->timestamp = b->timestamp;
+
+   a->compute_writes.incomplete |= b->compute_writes.incomplete;
+   for (unsigned i = 0; i < b->compute_writes.attachment_count; i++) {
+      const struct hk_cs_attachment *src = &b->compute_writes.attachments[i];
+      bool duplicate = false;
+      for (unsigned j = 0; j < a->compute_writes.attachment_count; j++) {
+         const struct hk_cs_attachment *dst =
+            &a->compute_writes.attachments[j];
+         duplicate |= dst->pointer == src->pointer && dst->size == src->size;
+      }
+      if (!duplicate) {
+         if (a->compute_writes.attachment_count == HK_CS_MAX_ATTACHMENTS) {
+            a->compute_writes.incomplete = true;
+         } else {
+            a->compute_writes.attachments[
+               a->compute_writes.attachment_count++] = *src;
+         }
+      }
+   }
+   for (unsigned i = 0; i < b->compute_writes.set_count; i++) {
+      struct hk_descriptor_set *src = b->compute_writes.sets[i];
+      bool duplicate = false;
+      for (unsigned j = 0; j < a->compute_writes.set_count; j++)
+         duplicate |= a->compute_writes.sets[j] == src;
+      if (!duplicate) {
+         if (a->compute_writes.set_count == HK_CS_MAX_ATTACHMENTS) {
+            a->compute_writes.incomplete = true;
+         } else {
+            a->compute_writes.sets[a->compute_writes.set_count++] = src;
+         }
+      }
+   }
 
    a->stats.calls += b->stats.calls;
    a->stats.cmds += b->stats.cmds;
@@ -585,6 +651,13 @@ hk_pool_usc_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 }
 
 void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cs_track_attachment(struct hk_cs *cs, enum hk_cs_write_pipe pipe,
+                            uint64_t pointer, uint64_t size);
+void hk_cs_track_descriptor_writes(struct hk_cs *cs,
+                                   struct hk_descriptor_state *desc,
+                                   enum hk_cs_write_pipe pipe);
+void hk_cs_mark_write_set_incomplete(struct hk_cs *cs,
+                                     enum hk_cs_write_pipe pipe);
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 
 static inline struct hk_cs *

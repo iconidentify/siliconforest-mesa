@@ -35,7 +35,14 @@
 #include "vk_shader.h"
 
 #include <fcntl.h>
+#ifdef HAVE_LIBDRM
 #include <xf86drm.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#include "asahi/lib/agx_device_d3dkmt.h"
+#include "asahi/lib/agx_device_win.h"
+#endif
 
 /* clang-format off */
 static const struct debug_named_value hk_perf_options[] = {
@@ -307,6 +314,34 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
 
+   /*
+    * honeykrisp-h1-execution.md SS2.2 row P4: per-logical-device re-open.
+    * The physical device already opened the KMD device once (for
+    * VK_EXT_memory_budget queries, hk_physical_device.h comment); this
+    * opens a second, independent handle for the logical device -- Linux
+    * re-derives the DRM render-node path from pdev->render_dev
+    * (drmGetDeviceFromDevId), Windows re-opens pdev->device_path (stashed
+    * by hk_create_win_physical_device, SS2.2 row P1) instead.
+    */
+#ifdef _WIN32
+   /*
+    * The D3DKMT path opens a second, independent D3DKMT device on the same
+    * adapter LUID -- which is exactly the WDDM analogue of re-opening the
+    * render node, and the reason agx_d3dkmt_open_device() is keyed on LUID
+    * rather than on a handle the caller already holds.
+    */
+   if (!pdev->d3dkmt) {
+      dev->dev.hdev =
+         CreateFileA(pdev->device_path, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+      if (dev->dev.hdev == INVALID_HANDLE_VALUE) {
+         result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                            "failed to open device %s", pdev->device_path);
+         goto fail_init;
+      }
+   }
+#else
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
    if (ret != 0) {
@@ -323,6 +358,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "failed to open device %s", path);
       goto fail_init;
    }
+#endif
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
 
@@ -338,6 +374,24 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->vk.enabled_features.pipelineRobustness = false;
    }
 
+#ifdef _WIN32
+   if (pdev->d3dkmt) {
+      if (!agx_d3dkmt_open_device(&dev->dev, &pdev->adapter_luid)) {
+         result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                            "Failed to open D3DKMT adapter");
+         goto fail_init;
+      }
+   } else {
+      agx_win_open_device(&dev->dev, dev->dev.hdev);
+   }
+
+   bool succ = agx_open_device(NULL, &dev->dev);
+   if (!succ) {
+      result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                         "Failed to open device");
+      goto fail_fd;
+   }
+#else
    bool succ = agx_open_device(NULL, &dev->dev);
    drmFreeDevice(&drm_device);
    if (!succ) {
@@ -345,8 +399,25 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "Failed to get DRM device: %m");
       goto fail_fd;
    }
+#endif
 
+   /*
+    * honeykrisp-h1-execution.md SS2.2 row P5 / SS3.3: vk_device_set_drm_fd
+    * sets device->sync = util_sync_provider_drm(fd) (VERIFIED
+    * vk_device.h:356-360) -- Windows has no fd, so build the provider from
+    * the winsys handle directly instead of adding a Windows case inside
+    * that Linux-shaped helper.
+    */
+#ifdef _WIN32
+   dev->vk.sync = pdev->d3dkmt ? util_sync_provider_d3dkmt(&dev->dev)
+                               : util_sync_provider_ntagx(dev->dev.hdev);
+   if (!dev->vk.sync) {
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_dev;
+   }
+#else
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
+#endif
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
@@ -429,6 +500,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
    agx_scratch_init(&dev->dev, &dev->scratch.vs);
    agx_scratch_init(&dev->dev, &dev->scratch.fs);
@@ -462,8 +534,20 @@ fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
 fail_dev:
    agx_close_device(&dev->dev);
+   goto fail_init;
 fail_fd:
+   /* agx_close_device() (fail_dev, above) already closed dev->dev.fd/hdev
+    * on paths that reach it; this label is only reached directly (skipping
+    * agx_close_device) when agx_open_device() itself failed, so the raw
+    * handle from the open()/CreateFileA() above is still live here. */
+#ifdef _WIN32
+   if (pdev->d3dkmt)
+      agx_d3dkmt_close_device(&dev->dev);
+   else
+      CloseHandle((HANDLE)dev->dev.hdev);
+#else
    close(dev->dev.fd);
+#endif
 fail_init:
    vk_device_finish(&dev->vk);
 fail_alloc:
@@ -509,6 +593,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
    agx_bo_unreference(&dev->dev, dev->heap);
+   simple_mtx_destroy(&dev->heap_lock);
    agx_bg_eot_cleanup(&dev->bg_eot);
    agx_close_device(&dev->dev);
    vk_free(&dev->vk.alloc, dev);

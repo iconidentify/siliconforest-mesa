@@ -132,11 +132,12 @@ agx_insert_waits_local(agx_context *ctx, agx_block *block)
       }
    }
 
-   /* If there are outstanding messages, wait for them. We don't do this for the
-    * exit block, though, since nothing else will execute in the shader so
-    * waiting is pointless.
+   /* If there are outstanding messages, wait for them. An ordinary shader's
+    * exit block does not need a wait because nothing executes afterward.
+    * Preamble state stores are different: the main shader consumes their
+    * architectural texture/sampler state after the preamble stops.
     */
-   if (block != agx_exit_block(ctx)) {
+   if (block != agx_exit_block(ctx) || ctx->is_preamble) {
       agx_builder b = agx_init_builder(ctx, agx_after_block_logical(block));
 
       for (unsigned slot = 0; slot < ARRAY_SIZE(slots); ++slot) {

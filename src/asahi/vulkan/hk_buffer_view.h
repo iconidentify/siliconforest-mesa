@@ -21,6 +21,7 @@ struct hk_buffer_view {
    struct vk_buffer_view vk;
    struct agx_texture_packed tex;
    struct agx_pbe_packed pbe;
+   struct hk_addr_range write_range;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_buffer_view, vk.base, VkBufferView,

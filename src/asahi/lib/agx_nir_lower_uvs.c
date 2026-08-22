@@ -49,6 +49,26 @@ group_for_varying(gl_varying_slot loc)
    }
 }
 
+static nir_def *
+upconvert_uvs_value(nir_builder *b, nir_intrinsic_instr *intr, nir_def *value)
+{
+   /* Native ST_VARY stores a 32-bit component.  A mediump producer may still
+    * be 16-bit even when the logical store_output type is 32-bit, so perform
+    * the type-correct conversion before replacing the generic IO intrinsic.
+    */
+   if (value->bit_size == 32)
+      return value;
+
+   assert(value->bit_size == 16);
+
+   nir_alu_type type =
+      nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+   assert(type == nir_type_float || type == nir_type_int ||
+          type == nir_type_uint);
+
+   return nir_convert_to_bit_size(b, value, type, 32);
+}
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -63,6 +83,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    nir_def *value = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
+
+   value = upconvert_uvs_value(b, intr, value);
 
    /* If there is only 1 user varying, it is at the base of the varying section.
     * This saves us an indirection on simple separate shaders.

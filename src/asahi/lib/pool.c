@@ -93,8 +93,13 @@ agx_pool_upload_aligned_with_bo(struct agx_pool *pool, const void *data,
                                 size_t sz, unsigned alignment,
                                 struct agx_bo **bo)
 {
+   struct agx_bo *local_bo = NULL;
+   struct agx_bo **out_bo = bo != NULL ? bo : &local_bo;
    struct agx_ptr transfer =
-      agx_pool_alloc_aligned_with_bo(pool, sz, alignment, bo);
+      agx_pool_alloc_aligned_with_bo(pool, sz, alignment, out_bo);
    memcpy(transfer.cpu, data, sz);
+   if (agx_bo_sync_for_device(*out_bo,
+                              transfer.gpu - (*out_bo)->va->addr, sz))
+      return 0;
    return transfer.gpu;
 }

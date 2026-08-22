@@ -27,6 +27,21 @@ binding_has_immutable_samplers(const VkDescriptorSetLayoutBinding *binding)
    }
 }
 
+static bool
+binding_may_be_shader_written(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 void
 hk_descriptor_stride_align_for_type(
    const struct hk_physical_device *pdev, VkDescriptorType type,
@@ -146,6 +161,9 @@ hk_CreateDescriptorSetLayout(VkDevice device,
 
    layout->binding_count = num_bindings;
 
+   for (uint32_t b = 0; b < num_bindings; b++)
+      layout->binding[b].write_range_index = UINT32_MAX;
+
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
       uint32_t b = binding->binding;
@@ -190,6 +208,11 @@ hk_CreateDescriptorSetLayout(VkDevice device,
       }
 
       layout->binding[b].array_size = binding->descriptorCount;
+
+      if (binding_may_be_shader_written(binding->descriptorType)) {
+         layout->binding[b].write_range_index = layout->write_range_count;
+         layout->write_range_count += binding->descriptorCount;
+      }
 
       if (vk_descriptor_type_is_dynamic(binding->descriptorType)) {
          layout->binding[b].dynamic_buffer_index = dynamic_buffer_count;

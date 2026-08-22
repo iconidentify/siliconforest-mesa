@@ -22,6 +22,7 @@
 #include "hk_wsi.h"
 
 #include "util/simple_mtx.h"
+#include "util/u_sync_provider.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_drm_syncobj.h"
@@ -30,9 +31,16 @@
 
 #include <fcntl.h>
 #include <string.h>
+#ifdef HAVE_LIBDRM
 #include <xf86drm.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#include "asahi/lib/agx_device_d3dkmt.h"
+#include "asahi/lib/agx_device_win.h"
+#endif
 
 static uint32_t
 hk_get_vk_version()
@@ -66,11 +74,21 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_dynamic_rendering = true,
       .KHR_dynamic_rendering_local_read = true,
       .KHR_external_fence = true,
+#ifndef _WIN32
+      /* honeykrisp-h1-execution.md SS2.2 row P2: fd-based external
+       * fence/memory/semaphore -- Linux-only (no NT-handle path in H1). */
       .KHR_external_fence_fd = true,
+#endif
       .KHR_external_memory = true,
+#ifndef _WIN32
       .KHR_external_memory_fd = true,
+#else
+      .KHR_external_memory_win32 = true,
+#endif
       .KHR_external_semaphore = true,
+#ifndef _WIN32
       .KHR_external_semaphore_fd = true,
+#endif
       .KHR_format_feature_flags2 = true,
       .KHR_fragment_shader_barycentric = false,
       .KHR_get_memory_requirements2 = true,
@@ -161,7 +179,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
+#ifndef _WIN32
       .EXT_external_memory_dma_buf = true,
+#endif
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -169,7 +189,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_host_query_reset = true,
       .EXT_host_image_copy = true,
       .EXT_image_2d_view_of_3d = true,
+#ifndef _WIN32
       .EXT_image_drm_format_modifier = true,
+#endif
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = false,
       .EXT_image_view_min_lod = instance->drirc.misc.image_view_min_lod,
@@ -177,8 +199,16 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_inline_uniform_block = true,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
+#ifndef _WIN32
       .EXT_map_memory_placed = true,
-      .EXT_memory_budget = false,
+#endif
+      /* Aurora: the budget implementation in this file is complete and, with
+       * pdev->sysmem always set on Windows, reports a live 90%-of-heap budget.
+       * Leaving the extension unadvertised meant a client had NO budget signal
+       * at all (DXVK logged "Budget n/a"), so it allocated until the driver
+       * refused instead of evicting -- DWM died on a 24 MB image at 614/640
+       * MiB and 822/896 MiB, tore down its swapchain and rebuilt forever. */
+      .EXT_memory_budget = true,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
@@ -186,7 +216,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_pipeline_creation_feedback = true,
       .EXT_pipeline_protected_access = true,
       .EXT_pipeline_robustness = true,
+#ifndef _WIN32
       .EXT_physical_device_drm = true,
+#endif
 #ifdef HK_USE_WSI_PLATFORM
       .EXT_present_timing = true,
 #endif
@@ -194,7 +226,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_private_data = true,
       .EXT_primitives_generated_query = false,
       .EXT_provoking_vertex = true,
+#ifndef _WIN32
       .EXT_queue_family_foreign = true,
+#endif
       .EXT_robustness2 = true,
       .EXT_sample_locations = true,
       .EXT_sampler_filter_minmax = false,
@@ -264,7 +298,22 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
+#ifdef _WIN32
+      /* Aurora: force-enable on Windows.  D3D11 FEATURE_LEVEL_11_1 requires
+       * it (DXVK: "if (!OutputMergerLogicOp || !vertexPipelineStoresAndAtomics)
+       * return D3D_FEATURE_LEVEL_11_0"), and hk's own 00-hk-defaults.conf
+       * already turns it on for engine_name_match="DXVK|vkd3d" with the note
+       * "Needed for FL11_1 ... the feature is hidden".  That drirc file is
+       * not loaded on Windows, so the option stayed false and every device
+       * came back 11_0 while the DDI advertised 11_1 -- the runtime then
+       * rejects the device and retries (measured: DWM created and destroyed
+       * a device 117 times in one boot without allocating a resource).
+       * DXVK is the only client of this ICD on Windows, i.e. exactly the
+       * engine the upstream config enables it for. */
+      .vertexPipelineStoresAndAtomics = true,
+#else
       .vertexPipelineStoresAndAtomics = instance->drirc.misc.enable_vertex_pipeline_stores_atomics,
+#endif
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -1192,6 +1241,17 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    return pdev->sysmem - total_used;
 }
 
+/*
+ * honeykrisp-h1-execution.md SS2.2 row P1: the drm-node walk entry point
+ * (registered as vk.physical_devices.try_create_for_drm, hk_instance.c),
+ * Linux/virtio-only -- open()/drmGetVersion/stat+major/minor/drmRender
+ * properties have no Windows equivalent. See hk_create_win_physical_device
+ * below (under #ifdef _WIN32, same file so it can reuse the static
+ * hk_get_device_extensions/features/properties helpers) for the Windows
+ * counterpart, registered instead as vk.physical_devices.enumerate
+ * (hk_instance.c, SS4 item 4).
+ */
+#ifdef HAVE_LIBDRM
 VkResult
 hk_create_drm_physical_device(struct vk_instance *_instance,
                               drmDevicePtr drm_device,
@@ -1363,6 +1423,213 @@ fail_fd:
    close(fd);
    return result;
 }
+#endif /* HAVE_LIBDRM */
+
+#ifdef _WIN32
+/*
+ * honeykrisp-h1-execution.md SS2.2 row P1 + SS3.3: the Windows counterpart
+ * of hk_create_drm_physical_device above -- CreateFile the KMD device
+ * interface path instead of a DRM render node, agx_win_open_device()
+ * instead of the DRM version probe, and the provider-based sync-type
+ * wiring from SS3.3 instead of vk_drm_syncobj_get_type(fd) (there is no
+ * fd to pass it on Windows).
+ *
+ * Deviates from the plan's illustrative CreateFileW(path) in one respect
+ * (OUR DESIGN, noted): uses CreateFileA/a plain `const char *path` instead
+ * of wide strings -- H1 has no real KMD or hardware device interface to
+ * enumerate against yet (see hk_enumerate_physical_devices_win below), so
+ * every reachable path in H1 is either the NTAGX_DEVICE_PATH env var or a
+ * literal this port controls; Unicode device paths are deferred to
+ * whichever H2 step actually wires up CM_Get_Device_Interface_List.
+ */
+VkResult
+hk_create_win_physical_device(struct vk_instance *_instance,
+                              const char *path,
+                              const struct agx_kmt_luid *luid,
+                              struct vk_physical_device **pdev_out)
+{
+   struct hk_instance *instance = (struct hk_instance *)_instance;
+   HANDLE hdev = INVALID_HANDLE_VALUE;
+   VkResult result;
+
+   assert((path != NULL) != (luid != NULL));
+
+   if (path != NULL) {
+      hdev = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+      if (hdev == INVALID_HANDLE_VALUE) {
+         return vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                          "failed to open device %s", path);
+      }
+   }
+
+   struct hk_physical_device *pdev =
+      vk_zalloc(&instance->vk.alloc, sizeof(*pdev), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+
+   if (pdev == NULL) {
+      result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_hdev;
+   }
+
+   /* We're render-only, same as the Linux path (hk_physical_device.h:34). */
+   pdev->master_fd = -1;
+
+   if (luid != NULL) {
+      pdev->d3dkmt = true;
+      pdev->adapter_luid = *luid;
+      if (!agx_d3dkmt_open_device(&pdev->dev, luid)) {
+         result = VK_ERROR_INCOMPATIBLE_DRIVER;
+         goto fail_pdev_alloc;
+      }
+   } else {
+      snprintf(pdev->device_path, sizeof(pdev->device_path), "%s", path);
+      agx_win_open_device(&pdev->dev, (void *)hdev);
+   }
+
+   if (!agx_open_device(NULL, &pdev->dev)) {
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
+      goto fail_winsys;
+   }
+
+   struct vk_physical_device_dispatch_table dispatch_table;
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &hk_physical_device_entrypoints, true);
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch_table, &wsi_physical_device_entrypoints, false);
+
+   struct vk_device_extension_table supported_extensions;
+   hk_get_device_extensions(instance, &supported_extensions);
+
+   struct vk_features supported_features;
+   hk_get_device_features(&pdev->dev, instance, &supported_extensions,
+                          &supported_features);
+
+   struct vk_properties properties;
+   hk_get_device_properties(&pdev->dev, instance, &properties);
+
+   if (pdev->d3dkmt) {
+      STATIC_ASSERT(sizeof(pdev->adapter_luid) == VK_LUID_SIZE);
+      memcpy(properties.deviceLUID, &pdev->adapter_luid, VK_LUID_SIZE);
+      properties.deviceNodeMask = 1;
+      properties.deviceLUIDValid = true;
+   }
+
+   /* No DRM render node on Windows (SS2.2 P1). */
+   properties.drmHasRender = false;
+
+   result = vk_physical_device_init(&pdev->vk, &instance->vk,
+                                    &supported_extensions, &supported_features,
+                                    &properties, &dispatch_table);
+   if (result != VK_SUCCESS)
+      goto fail_agx_device;
+
+   hk_physical_device_init_pipeline_cache(pdev);
+
+   const char *hk_sysmem = os_get_option("HK_SYSMEM");
+   if (hk_sysmem) {
+      uint64_t sysmem = strtoll(hk_sysmem, NULL, 10);
+      if (sysmem != LLONG_MIN && sysmem != LLONG_MAX) {
+         pdev->sysmem = sysmem;
+      }
+   }
+
+   uint64_t sysmem_size_B = hk_get_sysmem_heap_size(pdev);
+   if (sysmem_size_B == 0) {
+      result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                         "Failed to query total system memory");
+      goto fail_disk_cache;
+   }
+
+   uint32_t sysmem_heap_idx = pdev->mem_heap_count++;
+   pdev->mem_heaps[sysmem_heap_idx] = (struct hk_memory_heap){
+      .size = sysmem_size_B,
+      .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+   };
+
+   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = sysmem_heap_idx,
+   };
+
+   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = sysmem_heap_idx,
+   };
+
+   assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+   assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+
+   pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
+      .queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+                     VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT,
+
+      .queue_count = 1,
+   };
+   assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
+
+   /* honeykrisp-h1-execution.md SS3.3: provider-based sync-type wiring,
+    * the Windows counterpart of vk_drm_syncobj_get_type(fd). */
+   {
+      unsigned st_idx = 0;
+      struct util_sync_provider *p =
+         pdev->d3dkmt ? util_sync_provider_d3dkmt(&pdev->dev)
+                      : util_sync_provider_ntagx(pdev->dev.hdev);
+      if (!p) {
+         result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto fail_disk_cache;
+      }
+      pdev->syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(p);
+      p->finalize(p);
+      pdev->sync_types[st_idx++] = &pdev->syncobj_sync_type;
+      pdev->sync_types[st_idx++] = NULL;
+      assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
+      pdev->vk.supported_sync_types = pdev->sync_types;
+   }
+
+   result = hk_init_wsi(pdev);
+   if (result != VK_SUCCESS)
+      goto fail_disk_cache;
+
+   simple_mtx_init(&pdev->debug_compile_lock, mtx_plain);
+   *pdev_out = &pdev->vk;
+
+   return VK_SUCCESS;
+
+fail_disk_cache:
+   hk_physical_device_free_disk_cache(pdev);
+   vk_physical_device_finish(&pdev->vk);
+fail_agx_device:
+   agx_close_device(&pdev->dev);
+fail_winsys:
+   if (pdev->d3dkmt)
+      agx_d3dkmt_close_device(&pdev->dev);
+   vk_free(&instance->vk.alloc, pdev);
+   if (hdev != INVALID_HANDLE_VALUE)
+      CloseHandle(hdev);
+   return result;
+fail_pdev_alloc:
+   vk_free(&instance->vk.alloc, pdev);
+fail_hdev:
+   if (hdev != INVALID_HANDLE_VALUE)
+      CloseHandle(hdev);
+   return result;
+}
+#endif /* _WIN32 */
+
+/*
+ * honeykrisp-h1-execution.md SS4 item 4 / SS5.2 item 2: the `enumerate`
+ * callback itself (hk_enumerate_physical_devices_win) lives in the new
+ * hk_physical_device_win.c, not here -- it only needs
+ * hk_create_win_physical_device (declared in hk_physical_device.h) above,
+ * not this file's static helpers, so it doesn't need to share a TU.
+ */
 
 void
 hk_physical_device_destroy(struct vk_physical_device *vk_pdev)
@@ -1440,7 +1707,12 @@ hk_GetPhysicalDeviceMemoryProperties2(
                budget = vk_physical_device_heap_budget_from_system(
                   &pdev->vk, percent, heap->size, used);
             }
-
+            /* VK_EXT_memory_budget requires every advertised heap budget to
+             * be nonzero. GlobalMemoryStatusEx is expected to succeed, but a
+             * transient query failure or sub-MiB result must not violate the
+             * extension contract. This is a conformance floor, not a capacity
+             * policy; allocation still goes through the KMD. */
+            budget = MAX2(budget, MIN2(heap->size, 1ull << 20));
             p->heapBudget[i] = budget;
          }
 

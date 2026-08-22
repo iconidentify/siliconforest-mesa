@@ -56,6 +56,11 @@
  * robustness optimization even without soft fault.
  */
 #define AGX_ZERO_PAGE_ADDRESS (((uint64_t)1) << 32)
+#ifdef _WIN32
+/* Keep scratch outside the complete 64 KiB VidMm mapping of the zero BO. */
+#define AGX_ZERO_PAGE_SIZE    (65536)
+#else
 #define AGX_ZERO_PAGE_SIZE    (16384)
+#endif
 
 #define AGX_SCRATCH_PAGE_ADDRESS (AGX_ZERO_PAGE_ADDRESS + AGX_ZERO_PAGE_SIZE)

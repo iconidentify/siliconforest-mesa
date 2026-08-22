@@ -947,7 +947,77 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 
       shader->bo = agx_bo_create(&dev->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
-      memcpy(agx_bo_map(shader->bo), shader->b.binary, size);
+      if (!shader->bo) {
+         fprintf(stderr,
+                 "hk_upload_shader: preamble BO allocation of %zu B FAILED "
+                 "(AGX_BO_EXEC|AGX_BO_LOW_VA, stage %u)\n",
+                 size, (unsigned)shader->info.stage);
+         return;
+      }
+
+      void *map = agx_bo_map(shader->bo);
+      if (!map) {
+         fprintf(stderr,
+                 "hk_upload_shader: mapping the %zu B preamble BO FAILED "
+                 "(va=0x%" PRIx64 ", handle=%u, stage %u)\n",
+                 size, shader->bo->va ? shader->bo->va->addr : 0,
+                 (unsigned)shader->bo->handle, (unsigned)shader->info.stage);
+         return;
+      }
+
+      memcpy(map, shader->b.binary, size);
+      if (agx_bo_sync_for_device(shader->bo, 0, size)) {
+         agx_bo_unreference(&dev->dev, shader->bo);
+         shader->bo = NULL;
+         return;
+      }
+
+      /*
+       * READ THE UPLOADED SHADER BACK THROUGH ITS OWN MAPPING.
+       *
+       * This answers "is the binary really there and does it look like AGX
+       * code" from userspace, using the mapping Mesa already holds. No kernel
+       * physical read is involved -- two attempts at that bugchecked the
+       * machine, because the shader heap is write-combined and mapping a WC
+       * page under any other attribute is an alias ARM64 will not tolerate.
+       * Here the attribute question does not arise at all.
+       *
+       * It is a READBACK, not an echo of the source buffer: it prints what is
+       * visible at shader->bo's mapping after the copy, so "the bytes never
+       * landed" is distinguishable from "the bytes are wrong". Reading back
+       * through a write-combining mapping is slow but correct, and this runs
+       * once per shader under a debug flag.
+       */
+      if (ntagx_bo_log_enabled()) {
+         const volatile uint32_t *rb = (const volatile uint32_t *)map;
+         size_t words = size / 4;
+         size_t show = words < 32 ? words : 32;
+         size_t nonzero = 0;
+
+         for (size_t w = 0; w < words; w++)
+            if (rb[w] != 0)
+               nonzero++;
+
+         fprintf(stderr,
+                 "NTAGX_UPLOAD: preamble stage=%u handle=%u gpu_va=0x%" PRIx64
+                 " size=%zu preamble_off=%u  %zu/%zu words non-zero\n",
+                 (unsigned)shader->info.stage, (unsigned)shader->bo->handle,
+                 shader->bo->va ? (uint64_t)shader->bo->va->addr : 0ull, size,
+                 (unsigned)shader->b.info.preamble_offset, nonzero, words);
+         for (size_t w = 0; w < show; w += 8) {
+            fprintf(stderr, "NTAGX_UPLOAD: +0x%03zx ", w * 4);
+            for (size_t k = 0; k < 8 && (w + k) < show; k++)
+               fprintf(stderr, " %08x", rb[w + k]);
+            fprintf(stderr, "\n");
+         }
+         if (nonzero == 0)
+            fprintf(stderr,
+                    "NTAGX FATAL: the uploaded shader reads back as ALL ZEROES "
+                    "through its own mapping. The CPU's write did not reach "
+                    "this buffer, so the USC would execute nothing: real "
+                    "dispatch, real time, no stores, no fault.\n");
+      }
+
       shader->preamble_addr =
          shader->bo->va->addr + shader->b.info.preamble_offset;
    }
@@ -1062,6 +1132,52 @@ hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz)
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs);
 }
 
+static bool
+hk_write_is_descriptor_backed(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      return true;
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap:
+      return nir_deref_mode_may_be(nir_src_as_deref(intr->src[0]),
+                                   nir_var_mem_ssbo);
+   default:
+      return false;
+   }
+}
+
+static void
+hk_analyze_external_writes(nir_shader *nir, struct hk_shader_info *info)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (!nir_intrinsic_writes_external_memory(intr))
+               continue;
+
+            if (hk_write_is_descriptor_backed(intr))
+               info->descriptor_writes = true;
+            else
+               info->untracked_writes = true;
+         }
+      }
+   }
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -1072,6 +1188,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 {
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
+
+   /* Preserve the ownership class before descriptor and image lowering turns
+    * both Vulkan resources and raw device-address stores into global memory
+    * operations. */
+   hk_analyze_external_writes(nir, &shader->info);
 
    /* For now, only shader objects are supported */
    if (sw_stage == MESA_SHADER_VERTEX) {

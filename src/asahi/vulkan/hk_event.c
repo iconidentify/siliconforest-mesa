@@ -32,6 +32,16 @@ hk_CreateEvent(VkDevice device, const VkEventCreateInfo *pCreateInfo,
     */
    event->bo =
       agx_bo_create(&dev->dev, HK_EVENT_MEM_SIZE, 0, AGX_BO_WRITEBACK, "Event");
+   /* Aurora: agx_bo_create CAN fail and this path dereferenced the result
+    * unchecked -- agx_bo_map(event->bo) and event->bo->va->addr both fault.
+    * Measured: dwm.exe AND LogonUI.exe both died with 0xc0000005 at
+    * vulkan_asahi.dll+0xd5278, which disassembles to the `ldr x8, [x0, #0x50]`
+    * (event->bo->va) immediately after the call returned NULL.  A driver must
+    * report OOM, not access-violate the compositor. */
+   if (event->bo == NULL) {
+      vk_object_free(&dev->vk, pAllocator, event);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
    event->status = agx_bo_map(event->bo);
    event->addr = event->bo->va->addr;
 

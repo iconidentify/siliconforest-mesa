@@ -97,6 +97,8 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    uint64_t ro_base = hk_buffer_address_ro(buffer, 0) + head_offset_B;
    uint32_t tail_offset_B = view->vk.offset & 0xf;
    uint32_t tail_offset_el = tail_offset_B / util_format_get_blocksize(format);
+   view->write_range = hk_buffer_addr_range(
+      buffer, view->vk.offset, view->vk.range, false);
    assert(tail_offset_el * util_format_get_blocksize(format) == tail_offset_B &&
           "must be texel aligned");
 

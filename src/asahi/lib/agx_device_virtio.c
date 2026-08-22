@@ -285,6 +285,17 @@ const agx_device_ops_t agx_virtio_device_ops = {
    .submit = agx_virtio_submit,
    .bo_bind_object = agx_virtio_bo_bind_object,
    .bo_unbind_object = agx_virtio_bo_unbind_object,
+   /*
+    * honeykrisp-h1-execution.md SS1/SS2.1: same Linux-generic bodies as
+    * agx_device_drm_ops (agx_device.c) -- asahi_simple_ioctl already
+    * dispatches on dev->is_virtio internally, and GEM_CLOSE/munmap are
+    * DRM-core/OS behavior on the local guest fd, unaffected by whether the
+    * asahi-specific ioctls above are vdrm-forwarded.
+    */
+   .simple_ioctl = asahi_simple_ioctl,
+   .bo_munmap = agx_drm_bo_munmap,
+   .bo_sync_for_device = agx_drm_bo_sync_for_device,
+   .bo_free = agx_drm_bo_close,
 };
 
 bool

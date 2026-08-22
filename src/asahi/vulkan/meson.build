@@ -48,6 +48,14 @@ hk_files = files(
   'hk_wsi.h'
 )
 
+# honeykrisp-h1-execution.md SS5.2 item 2: hk_physical_device_win.c
+# (SS4 item 4) is the Windows `enumerate` callback -- only reachable/needed
+# there, the Linux drm-node walk (hk_create_drm_physical_device,
+# hk_physical_device.c) has no counterpart file.
+if host_machine.system() == 'windows'
+  hk_files += files('hk_physical_device_win.c')
+endif
+
 hk_drirc = custom_target(
   'hk_drirc',
   input  : [files('hk_drirc_gen.py'), drirc_gen, '00-hk-defaults.conf'],
@@ -72,8 +80,12 @@ hk_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
+# honeykrisp-h1-execution.md SS5.2 item 2: dep_libdrm is null_dep on
+# Windows anyway (root meson.build: system_has_kms_drm is false there, so
+# dep_libdrm is never even a real dependency() call) -- only add it when
+# found, matching the "upstream-shaped, not forked" argument (SS7) for why
+# this edit is small enough to plausibly upstream.
 hk_deps = [
-  dep_libdrm,
   idep_nir,
   idep_vulkan_runtime,
   idep_vulkan_util,
@@ -83,7 +95,16 @@ hk_deps = [
   idep_libagx,
   idep_libagx_shaders_h,
 ]
+if dep_libdrm.found()
+  hk_deps += dep_libdrm
+endif
 
+# honeykrisp-h1-execution.md SS5.2 item 2: no virtio-gpu include dirs on
+# Windows (same rationale as libasahi_lib, src/asahi/lib/meson.build); the
+# overlay drm-uapi shim + kmd-uapi-core/kmd-syncobj-core headers hk_queue.c
+# (SS3.2 -- "drm-uapi/drm.h" for DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) and
+# hk_physical_device_win.c/hk_device.c need are supplied via -Dc_args at
+# `meson setup`, same as src/asahi/lib/meson.build's libasahi_lib.
 libhk = static_library(
   'hk',
   [
@@ -92,17 +113,19 @@ libhk = static_library(
     hk_files,
     sha1_h,
   ],
-  include_directories : [
-    inc_gallium,
-    inc_gallium_aux,
-    inc_include,
-    inc_src,
-    inc_asahi,
-    inc_virtio_gpu,
-    inc_virtio_vdrm,
-  ],
+  include_directories : host_machine.system() == 'windows'
+    ? [inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi]
+    : [
+        inc_gallium,
+        inc_gallium_aux,
+        inc_include,
+        inc_src,
+        inc_asahi,
+        inc_virtio_gpu,
+        inc_virtio_vdrm,
+      ],
   link_with : [libasahi_lib, libasahi_layout, libasahi_compiler],
-  c_args : ['-Wno-c2x-extensions'],
+  c_args : ['-Wno-c2x-extensions', hk_win_c_args],
   dependencies : [hk_deps],
   gnu_symbol_visibility : 'hidden',
 )
@@ -112,6 +135,20 @@ libvulkan_asahi = shared_library(
   link_whole : [libhk],
   link_args: [ld_args_build_id],
   gnu_symbol_visibility : 'hidden',
+  # honeykrisp Windows port: the driver is built with hidden visibility, so the
+  # loader-facing ICD entry points (vk_icdGetInstanceProcAddr,
+  # vk_icdNegotiateLoaderICDInterfaceVersion) are NOT auto-exported by lld on
+  # PE targets -- verified: the .dll linked with 381 exports, all of them
+  # SPIRV-Tools C++ symbols, and neither ICD symbol present. Mesa's other
+  # Windows-capable Vulkan drivers (dzn src/microsoft/vulkan/meson.build:78,
+  # radv, lavapipe) all pass the generated vulkan_api.def here; do the same.
+  vs_module_defs : vulkan_api_def,
+  # Windows DLLs carry no 'lib' prefix. meson's mingw default produced
+  # libvulkan_asahi.dll while the generated ICD manifest points at
+  # vulkan_asahi.dll (icd_file_name uses libname_prefix, empty on Windows) --
+  # the loader would never find the driver. VERIFIED by auditing the built
+  # artifact against asahi_icd.aarch64.json.
+  name_prefix : '',
   install : true,
 )
 

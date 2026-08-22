@@ -109,6 +109,11 @@ struct hk_shader_info {
    uint8_t cull_distance_array_size;
    uint8_t set_count;
 
+   /* External stores whose ownership can be derived from bound Vulkan
+    * descriptors, versus raw/global/bindless stores that cannot. */
+   bool descriptor_writes;
+   bool untracked_writes;
+
    /* XXX: is there a less goofy way to do this? I really don't want dynamic
     * allocation here.
     */

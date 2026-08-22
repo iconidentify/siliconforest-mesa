@@ -632,7 +632,9 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+         .descriptorType = type == BUF2IMG
+                              ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
@@ -640,6 +642,7 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
 
    const VkDescriptorSetLayoutCreateInfo info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
       .bindingCount = ARRAY_SIZE(bindings),
       .pBindings = bindings,
    };
@@ -793,7 +796,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
 
          VkPipelineLayout pipeline_layout;
          result = get_image_copy_pipeline_layout(device, meta, &key, set_layout,
-                                                 &pipeline_layout, false);
+                                                 &pipeline_layout, IMG2BUF);
          if (unlikely(result != VK_SUCCESS)) {
             vk_command_buffer_set_error(cmd, result);
             return;
@@ -983,7 +986,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
 
          VkPipelineLayout pipeline_layout;
          result = get_image_copy_pipeline_layout(device, meta, &key, set_layout,
-                                                 &pipeline_layout, true);
+                                                 &pipeline_layout, BUF2IMG);
          if (unlikely(result != VK_SUCCESS)) {
             vk_command_buffer_set_error(cmd, result);
             return;
@@ -1090,7 +1093,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
 
    VkDescriptorSetLayout set_layout;
    VkResult result =
-      get_image_copy_descriptor_set_layout(device, meta, &set_layout, BUF2IMG);
+      get_image_copy_descriptor_set_layout(device, meta, &set_layout, IMG2IMG);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(cmd, result);
       return;
@@ -1147,7 +1150,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
 
             VkPipelineLayout pipeline_layout;
             result = get_image_copy_pipeline_layout(
-               device, meta, &key, set_layout, &pipeline_layout, true);
+               device, meta, &key, set_layout, &pipeline_layout, IMG2IMG);
             if (unlikely(result != VK_SUCCESS)) {
                vk_command_buffer_set_error(cmd, result);
                return;

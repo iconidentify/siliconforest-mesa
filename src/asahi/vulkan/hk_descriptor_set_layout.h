@@ -38,6 +38,10 @@ struct hk_descriptor_set_binding_layout {
    /* Index into the dynamic buffer binding array */
    uint8_t dynamic_buffer_index;
 
+   /* First element in hk_descriptor_set::write_ranges, or UINT32_MAX when
+    * this binding can never be shader-written. */
+   uint32_t write_range_index;
+
    /* Immutable samplers (or NULL if no immutable samplers) */
    struct hk_sampler **immutable_samplers;
 };
@@ -51,6 +55,10 @@ struct hk_descriptor_set_layout {
 
    /* Number of bindings in this descriptor set */
    uint32_t binding_count;
+
+   /* Host-only sidecar entries. These are never part of the GPU descriptor
+    * buffer and exist solely to publish exact shader-write ownership. */
+   uint32_t write_range_count;
 
    /* Bindings in this descriptor set */
    struct hk_descriptor_set_binding_layout binding[0];

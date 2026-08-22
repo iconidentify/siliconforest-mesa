@@ -21,11 +21,12 @@
 #include "agx_pack.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
-#include <xf86drm.h>
+#include "drm-uapi/drm.h"
 #include "util/list.h"
 #include "util/macros.h"
 #include "util/u_dynarray.h"
@@ -35,6 +36,10 @@
 #include "layout.h"
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
+
+#ifdef _WIN32
+#include "agx_device_d3dkmt.h"
+#endif
 
 /*
  * We need to specially handle submits with no control streams. The kernel
@@ -46,7 +51,54 @@ static VkResult
 queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                    struct vk_queue_submit *submit)
 {
-   int fd = dev->dev.fd;
+   /* DXVK's ID3D11DeviceContext4::Signal reaches this exact shape.  A GPU
+    * wait/signal callback pair on a context with no DMA buffer is not an
+    * execution guarantee on WDDM: live callbacks returned success while the
+    * output fence never advanced.  Prior queue work is already submitted, so
+    * make the ordering point observable before publishing the output. */
+   if (submit->wait_count == 0 && submit->signal_count != 0) {
+      uint32_t queue_syncobj = queue->drm.syncobj;
+      uint64_t queue_point = queue->drm.timeline_value;
+
+#if defined(_WIN32) && AGX_GPU_DIAG >= 2
+      uint64_t observed = 0;
+
+      if (dev->vk.sync->query(dev->vk.sync, &queue_syncobj, &observed, 1, 0))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+      if (observed < queue_point)
+         agx_d3dkmt_diag_sync_gap(&dev->dev, queue->drm.id, queue_syncobj,
+                                  queue_point, observed);
+#endif
+
+      if (dev->vk.sync->timeline_wait(
+             dev->vk.sync, &queue_syncobj, &queue_point, 1, INT64_MAX,
+             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+             NULL))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+      for (unsigned i = 0; i < submit->signal_count; ++i) {
+         struct vk_sync_signal *signal = &submit->signals[i];
+         assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
+         const struct vk_drm_syncobj *syncobj =
+            vk_sync_as_drm_syncobj(signal->sync);
+         uint32_t output_syncobj = syncobj->syncobj;
+
+         if (signal->sync->flags & VK_SYNC_IS_TIMELINE) {
+            uint64_t output_point = signal->signal_value;
+
+            if (dev->vk.sync->timeline_signal(
+                   dev->vk.sync, &output_syncobj, &output_point, 1))
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         } else {
+            if (dev->vk.sync->signal(dev->vk.sync, &output_syncobj, 1))
+               return vk_error(dev, VK_ERROR_DEVICE_LOST);
+         }
+      }
+
+      return VK_SUCCESS;
+   }
 
    /* Transfer the waits into the queue timeline. */
    for (unsigned i = 0; i < submit->wait_count; ++i) {
@@ -55,8 +107,10 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
       assert(vk_sync_type_is_drm_syncobj(wait->sync->type));
       const struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(wait->sync);
 
-      drmSyncobjTransfer(fd, queue->drm.syncobj, ++queue->drm.timeline_value,
-                         syncobj->syncobj, wait->wait_value, 0);
+      if (dev->vk.sync->transfer(dev->vk.sync, queue->drm.syncobj,
+                                ++queue->drm.timeline_value,
+                                syncobj->syncobj, wait->wait_value, 0))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
 
    /* Transfer the queue timeline into each out fence. They will all be
@@ -69,8 +123,11 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
       const struct vk_drm_syncobj *syncobj =
          vk_sync_as_drm_syncobj(signal->sync);
 
-      drmSyncobjTransfer(fd, syncobj->syncobj, signal->signal_value,
-                         queue->drm.syncobj, queue->drm.timeline_value, 0);
+      if (dev->vk.sync->transfer(dev->vk.sync, syncobj->syncobj,
+                                signal->signal_value,
+                                queue->drm.syncobj,
+                                queue->drm.timeline_value, 0))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
    }
 
    return VK_SUCCESS;
@@ -220,6 +277,108 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    }
 }
 
+static bool
+hk_submit_attachment_add(struct drm_asahi_attachment *attachments,
+                         unsigned *count, unsigned limit,
+                         uint64_t pointer, uint64_t size)
+{
+   if (pointer == 0 || size == 0 || pointer > UINT64_MAX - size)
+      return false;
+
+   for (unsigned i = 0; i < *count; i++) {
+      if (attachments[i].pointer == pointer && attachments[i].size == size)
+         return true;
+   }
+   if (*count == limit)
+      return false;
+
+   attachments[(*count)++] = (struct drm_asahi_attachment){
+      .pointer = pointer,
+      .size = size,
+   };
+   return true;
+}
+
+static bool
+hk_submit_collect_write_set(struct hk_cs_write_tracker *tracker,
+                            struct drm_asahi_attachment *attachments,
+                            unsigned *count, unsigned limit)
+{
+   for (unsigned i = 0; i < tracker->attachment_count; i++) {
+      const struct hk_cs_attachment *att = &tracker->attachments[i];
+      if (!hk_submit_attachment_add(attachments, count, limit,
+                                    att->pointer, att->size))
+         return false;
+   }
+
+   for (unsigned i = 0; i < tracker->set_count; i++) {
+      const struct hk_descriptor_set *set = tracker->sets[i];
+      if (set == NULL || set->layout == NULL)
+         return false;
+
+      for (unsigned b = 0; b < set->layout->binding_count; b++) {
+         const struct hk_descriptor_set_binding_layout *binding =
+            &set->layout->binding[b];
+         if (binding->write_range_index == UINT32_MAX)
+            continue;
+
+         for (unsigned j = 0; j < binding->array_size; j++) {
+            uint64_t index = (uint64_t)binding->write_range_index + j;
+            if (index >= set->write_range_count)
+               return false;
+            const struct hk_addr_range *range = &set->write_ranges[index];
+            if (range->addr == 0 && range->range == 0)
+               continue;
+            if (!hk_submit_attachment_add(attachments, count, limit,
+                                          range->addr, range->range))
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+static VkResult
+hk_submit_emit_write_set(struct hk_device *dev, struct util_dynarray *payload,
+                         struct hk_cs_write_tracker *tracker,
+                         enum drm_asahi_cmd_type type,
+                         const struct drm_asahi_attachment *fixed,
+                         unsigned fixed_count, bool *complete)
+{
+   struct drm_asahi_attachment attachments[HK_CS_MAX_ATTACHMENTS] = {0};
+   unsigned count = 0;
+   unsigned limit = MIN2(HK_CS_MAX_ATTACHMENTS,
+                         dev->dev.params.max_attachments);
+
+   *complete &= !tracker->incomplete;
+
+   for (unsigned i = 0; i < fixed_count; i++) {
+      if (!hk_submit_attachment_add(attachments, &count, limit,
+                                    fixed[i].pointer, fixed[i].size))
+         goto incomplete;
+   }
+   if (!hk_submit_collect_write_set(tracker, attachments, &count, limit))
+      goto incomplete;
+   if (count == 0)
+      return VK_SUCCESS;
+
+   const struct drm_asahi_cmd_header header = {
+      .cmd_type = type,
+      .size = sizeof(attachments[0]) * count,
+      .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+   };
+   util_dynarray_append(payload, header);
+   util_dynarray_append_array(payload, struct drm_asahi_attachment,
+                              attachments, count);
+   return VK_SUCCESS;
+
+incomplete:
+   return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                    "GPU write set exceeds %u attachments",
+                    limit);
+}
+
 static void
 asahi_fill_sync(struct drm_asahi_sync *sync, struct vk_sync *vk_sync,
                 uint64_t value)
@@ -262,23 +421,34 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
 {
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
 
+   /*
+    * honeykrisp-h1-execution.md SS2.2 row P9: both blocks are unreachable
+    * on Windows already (dev->dev.is_virtio is unconditionally false,
+    * agx_win_open_device() sets it), but naming `struct
+    * asahi_ccmd_submit_res` by value needs its complete type, which
+    * agx_device.h only forward-declares when !HAVE_LIBDRM (SS2.1 row D2).
+    * HAVE_VDRM is the same "is virtio available" define hk_device_memory.c
+    * uses for the same reason (src/asahi/lib/meson.build, Step 8/9).
+    */
+#ifdef HAVE_VDRM
    if (dev->dev.is_virtio) {
       u_rwlock_rdlock(&dev->external_bos.lock);
       virt.extres_count = util_dynarray_num_elements(
          &dev->external_bos.list, struct asahi_ccmd_submit_res);
       virt.extres = util_dynarray_begin(&dev->external_bos.list);
    }
+#endif
 
    int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
 
+#ifdef HAVE_VDRM
    if (dev->dev.is_virtio)
       u_rwlock_rdunlock(&dev->external_bos.lock);
+#endif
 
-   /* XXX: don't trap */
-   if (ret) {
-      fprintf(stderr, "DRM_IOCTL_ASAHI_SUBMIT failed: %m\n");
-      assert(0);
-   }
+   if (ret)
+      return vk_device_set_lost(&dev->vk,
+                                "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
 
    return VK_SUCCESS;
 }
@@ -314,15 +484,33 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
       unsigned base_offs = offs;
       unsigned cdm_count = 0, vdm_count = 0;
 
-      /* We need to fix up the barriers since barriers are ioctl-relative */
-      for (unsigned i = 0; i < count; ++i) {
+      /* We need to fix up the barriers since barriers are ioctl-relative.
+       * Synthetic attachment records do not count against the firmware
+       * command limit and must travel in the same ioctl as the following
+       * hardware command.
+       */
+      unsigned hardware_count = 0;
+      struct drm_asahi_cmd_header *first_hardware = NULL;
+      while (hardware_count < count) {
          struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + offs);
          offs += sizeof(*cmd) + cmd->size;
 
-         if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER)
+         if (cmd->cmd_type == DRM_ASAHI_SET_VERTEX_ATTACHMENTS ||
+             cmd->cmd_type == DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS ||
+             cmd->cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS) {
+            assert(cmd->vdm_barrier == DRM_ASAHI_BARRIER_NONE);
+            assert(cmd->cdm_barrier == DRM_ASAHI_BARRIER_NONE);
+            continue;
+         } else if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER) {
             vdm_count++;
-         else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE)
+         } else {
+            assert(cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE);
             cdm_count++;
+         }
+
+         if (first_hardware == NULL)
+            first_hardware = cmd;
+         hardware_count++;
 
          if (cmd->vdm_barrier != DRM_ASAHI_BARRIER_NONE) {
             assert(cmd->vdm_barrier >= submitted_vdm);
@@ -341,13 +529,11 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
        * TODO: there might be a more performant way to do this.
        */
       if (last && !first) {
-         struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + base_offs);
+         if (first_hardware->vdm_barrier == DRM_ASAHI_BARRIER_NONE)
+            first_hardware->vdm_barrier = 0;
 
-         if (cmd->vdm_barrier == DRM_ASAHI_BARRIER_NONE)
-            cmd->vdm_barrier = 0;
-
-         if (cmd->cdm_barrier == DRM_ASAHI_BARRIER_NONE)
-            cmd->cdm_barrier = 0;
+         if (first_hardware->cdm_barrier == DRM_ASAHI_BARRIER_NONE)
+            first_hardware->cdm_barrier = 0;
       }
 
       bool has_in_syncs = first;
@@ -812,12 +998,59 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
    unsigned nr_vdm = 0, nr_cdm = 0;
+   bool write_set_complete = true;
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         struct drm_asahi_attachment fixed[2] = {0};
+         unsigned fixed_count = 0;
+         VkResult write_result;
+
+         if (cs->type == HK_CS_VDM) {
+            if (cs->writes_occlusion_queries) {
+               assert(dev->occlusion_queries.bo != NULL);
+               fixed[fixed_count++] = (struct drm_asahi_attachment){
+                  .pointer = dev->occlusion_queries.bo->va->addr,
+                  .size = dev->occlusion_queries.bo->size,
+               };
+            }
+            if (cs->timestamp.end.addr) {
+               fixed[fixed_count++] = (struct drm_asahi_attachment){
+                  .pointer = cs->timestamp.end.addr,
+                  .size = sizeof(uint64_t),
+               };
+            }
+
+            write_result = hk_submit_emit_write_set(
+               dev, &payload, &cs->vertex_writes,
+               DRM_ASAHI_SET_VERTEX_ATTACHMENTS, NULL, 0,
+               &write_set_complete);
+            if (write_result == VK_SUCCESS) {
+               write_result = hk_submit_emit_write_set(
+                  dev, &payload, &cs->fragment_writes,
+                  DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS, fixed, fixed_count,
+                  &write_set_complete);
+            }
+         } else {
+            if (cs->timestamp.end.addr) {
+               fixed[fixed_count++] = (struct drm_asahi_attachment){
+                  .pointer = cs->timestamp.end.addr,
+                  .size = sizeof(uint64_t),
+               };
+            }
+            write_result = hk_submit_emit_write_set(
+               dev, &payload, &cs->compute_writes,
+               DRM_ASAHI_SET_COMPUTE_ATTACHMENTS, fixed, fixed_count,
+               &write_set_complete);
+         }
+         if (write_result != VK_SUCCESS) {
+            util_dynarray_fini(&payload);
+            return write_result;
+         }
+
          /* Barrier on previous command */
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, nr_vdm, nr_cdm);
@@ -861,7 +1094,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    struct drm_asahi_submit submit_ioctl = {
-      .flags = 0,
+      .flags = dev->dev.write_set_contract && write_set_complete
+                  ? AGX_SUBMIT_WRITE_SET_COMPLETE
+                  : 0,
       .queue_id = queue->drm.id,
       .in_sync_count = wait_count,
       .out_sync_count = submit->signal_count + 1,
@@ -898,8 +1133,8 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
-      int err = drmSyncobjTimelineWait(
-         dev->dev.fd, &queue->drm.syncobj, &queue->drm.timeline_value, 1,
+      int err = dev->vk.sync->timeline_wait(
+         dev->vk.sync, &queue->drm.syncobj, &queue->drm.timeline_value, 1,
          INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
 
       if (err) {
@@ -973,7 +1208,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    queue->drm.id = agx_create_command_queue(&dev->dev, drm_priority);
    queue->drm.virt_ring_idx = drm_priority + 1;
 
-   if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
+   if (dev->vk.sync->create(dev->vk.sync, 0, &queue->drm.syncobj)) {
       mesa_loge("drmSyncobjCreate() failed %d\n", errno);
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
       vk_queue_finish(&queue->vk);
@@ -983,8 +1218,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    }
 
    uint64_t initial_value = 1;
-   if (drmSyncobjTimelineSignal(dev->dev.fd, &queue->drm.syncobj,
-                                &initial_value, 1)) {
+   if (dev->vk.sync->timeline_signal(dev->vk.sync, &queue->drm.syncobj,
+                                     &initial_value, 1)) {
       hk_queue_finish(dev, queue);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "DRM_IOCTL_TIMELINE_SYNCOBJ_SIGNAL failed: %m");
@@ -996,7 +1231,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 void
 hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
-   drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
+   dev->vk.sync->destroy(dev->vk.sync, queue->drm.syncobj);
    agx_destroy_command_queue(&dev->dev, queue->drm.id);
    vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);

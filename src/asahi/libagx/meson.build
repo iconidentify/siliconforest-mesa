@@ -24,6 +24,19 @@ libagx_spv = custom_target(
     '-I' + join_paths(meson.project_source_root(), 'src/poly/cl'),
     '-I' + join_paths(meson.current_source_dir(), '.'),
     '-I' + join_paths(meson.current_source_dir(), '../../'),
+    # BUILD-STATUS.md stage-1 (native mesa_clc/asahi_clc bring-up): the
+    # G13/G15/G17 fail-closed chip-detection header, included as
+    # "lib/agx_chip.h" from libagx_dgc.h, lives at src/asahi/lib/agx_chip.h.
+    # The '../../' entry above only reaches src/ (two levels up from
+    # src/asahi/libagx), which resolves every OTHER quoted include this
+    # custom_target needs ("compiler/libcl/libcl.h" etc.) but not this one,
+    # which needs src/asahi/ (one level up). This is a real, pre-existing
+    # gap in this tree's own libagx/meson.build -- VERIFIED by hand-driving
+    # mesa_clc with an extra -I: without it, `fatal error: 'lib/agx_chip.h'
+    # file not found`; with it, libagx.spv builds clean. Not part of the
+    # honeykrisp Windows port itself (host_machine.system() doesn't gate
+    # this), just never previously exercised for this CL compile.
+    '-I' + join_paths(meson.project_source_root(), 'src/asahi'),
     '-I' + join_paths(meson.current_source_dir(), 'shaders'),
     '-I' + join_paths(meson.current_build_dir(), '../genxml'),
     cl_args,

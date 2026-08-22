@@ -9,6 +9,7 @@
 
 #include "asahi/lib/agx_device.h"
 #include <sys/types.h>
+#include "asahi/lib/agx_d3dkmt.h"
 #include "hk_private.h"
 #include "vk_physical_device.h"
 #include "vk_sync.h"
@@ -30,8 +31,27 @@ struct hk_memory_heap {
 
 struct hk_physical_device {
    struct vk_physical_device vk;
-   dev_t render_dev;
+   dev_t render_dev; /* unused on Windows -- see device_path below */
    int master_fd;
+
+   /*
+    * honeykrisp-h1-execution.md SS2.2 row P1: the KMD device-interface
+    * path this physical device was opened from (CreateFileA target),
+    * stashed so hk_device.c's per-logical-device re-open (SS2.2 row P4)
+    * doesn't need a DRM render-node round trip to rediscover it. Sized
+    * like Win32 MAX_PATH without pulling in <windows.h> here.
+    */
+   char device_path[260];
+
+   /*
+    * The D3DKMT adapter this physical device was opened from, when it was
+    * opened that way (d3dkmt == true). This is the identity Vulkan is
+    * supposed to expose as VkPhysicalDeviceIDProperties::deviceLUID and the
+    * one a D3D application matches an IDXGIAdapter against -- which a raw NT
+    * file handle on a private ioctl node could never provide.
+    */
+   bool d3dkmt;
+   struct agx_kmt_luid adapter_luid;
 
    /* Only used for VK_EXT_memory_budget */
    struct agx_device dev;
@@ -69,10 +89,33 @@ VkResult hk_create_drm_physical_device(struct vk_instance *vk_instance,
                                        struct _drmDevice *drm_device,
                                        struct vk_physical_device **pdev_out);
 
+#ifdef _WIN32
+/* honeykrisp-h1-execution.md SS2.2 row P1 (hk_physical_device.c) / SS4 item
+ * 4 (hk_physical_device_win.c). */
+/*
+ * Exactly one of `path` and `luid` must be non-NULL: `path` opens the legacy
+ * private \\.\AGXKMD ioctl node, `luid` opens a WDDM adapter through
+ * D3DKMT. The legacy path is retained only because patch 0009's user-mode
+ * shim has no WDDM miniport to talk to.
+ */
+VkResult hk_create_win_physical_device(struct vk_instance *vk_instance,
+                                       const char *path,
+                                       const struct agx_kmt_luid *luid,
+                                       struct vk_physical_device **pdev_out);
+VkResult hk_enumerate_physical_devices_win(struct vk_instance *vk_instance);
+#endif
+
 void hk_physical_device_destroy(struct vk_physical_device *vk_device);
 
+/*
+ * honeykrisp-h1-execution.md SS4 item 1: extend the WSI-platform guard with
+ * VK_USE_PLATFORM_WIN32_KHR -- turns on KHR_swapchain/present extensions
+ * (hk_physical_device.c, all #ifdef HK_USE_WSI_PLATFORM) and the instance
+ * surface extensions (hk_instance.c) for the GDI/CPU present path
+ * (wsi_common_win32.cpp, upstream-shipped already).
+ */
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) ||                                    \
    defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||    \
-   defined(VK_USE_PLATFORM_DISPLAY_KHR)
+   defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(VK_USE_PLATFORM_WIN32_KHR)
 #define HK_USE_WSI_PLATFORM
 #endif

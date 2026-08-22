@@ -190,8 +190,13 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
    num_copies = num_copies2;
 
    /* Set up the bookkeeping */
-   struct copy_ctx _ctx = {.entry_count = num_copies};
-   struct copy_ctx *ctx = &_ctx;
+   struct copy_ctx *ctx = calloc(1, sizeof(*ctx));
+   if (ctx == NULL) {
+      free(copies2);
+      UNREACHABLE("failed to allocate parallel-copy context");
+   }
+
+   ctx->entry_count = num_copies;
 
    memset(ctx->physreg_dest, 0, sizeof(ctx->physreg_dest));
    memset(ctx->physreg_use_count, 0, sizeof(ctx->physreg_use_count));
@@ -387,6 +392,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       entry->done = true;
    }
 
+   free(ctx);
    free(copies2);
 }
 

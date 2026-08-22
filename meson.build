@@ -983,7 +983,10 @@ with_poly = [
 
 dep_clc = null_dep
 if with_clc
-  dep_clc = dependency('libclc')
+  # honeykrisp-h1-execution.md SS5.2: same rationale as dep_llvm above --
+  # libclc backs mesa_clc, a native-machine-only tool when cross-compiling
+  # to Windows.
+  dep_clc = dependency('libclc', native : host_machine.system() == 'windows' and meson.is_cross_build())
 endif
 
 with_gfx_compute = [
@@ -1995,9 +1998,31 @@ _shared_llvm = get_option('shared-llvm') \
   .disable_auto_if(host_machine.system() == 'windows') \
   .allowed()
 
+#
+# honeykrisp-h1-execution.md SS5.2: cross-compiling to Windows (this port),
+# LLVM/libclc are consumed ONLY by the native precompiler tools
+# (mesa_clc/asahi_clc, both `native : not meson.can_run_host_binaries()` --
+# src/compiler/clc/meson.build, src/asahi/clc/meson.build), never by the
+# cross (Windows) target itself: no Vulkan/GL driver in this tree runs on
+# Windows and also needs LLVM (root meson.build already hard-excludes
+# windows from the driver auto-list). Upstream's `method` ternary above
+# assumes a *native* Windows build (host==build==windows, e.g. clang-cl),
+# where an llvm-config script is unlikely; that's a different scenario
+# from ours (build==macOS, host==windows, cross). Resolve against the
+# BUILD machine (Homebrew's llvm-config) instead when cross-compiling to
+# Windows -- **OUR DESIGN**, scoped narrowly so it can't change behavior
+# for the native-Windows-build case this ternary was written for.
+_win_cross_native_llvm = host_machine.system() == 'windows' and meson.is_cross_build()
+
+_dep_llvm_method = host_machine.system() == 'windows' ? 'auto' : 'config-tool'
+if _win_cross_native_llvm
+  _dep_llvm_method = 'config-tool'
+endif
+
 dep_llvm = dependency(
   'llvm',
-  method : host_machine.system() == 'windows' ? 'auto' : 'config-tool',
+  method : _dep_llvm_method,
+  native : _win_cross_native_llvm,
   version : _llvm_version,
   modules : llvm_modules,
   optional_modules : llvm_optional_modules,
@@ -2069,7 +2094,12 @@ if with_clc
     '< @0@.@1@'.format(chosen_llvm_version_major, chosen_llvm_version_minor + 1) ]
 
   # LLVMSPIRVLib is available at https://github.com/KhronosGroup/SPIRV-LLVM-Translator
-  dep_llvmspirvlib = dependency('LLVMSPIRVLib', required : true, version : _llvmspirvlib_version)
+  # honeykrisp-h1-execution.md SS5.2: same native-machine rationale as
+  # dep_llvm/dep_clc above -- this backs mesa_clc, a native-only tool when
+  # cross-compiling to Windows.
+  dep_llvmspirvlib = dependency('LLVMSPIRVLib', required : true,
+    version : _llvmspirvlib_version,
+    native : host_machine.system() == 'windows' and meson.is_cross_build())
 else
   dep_llvmspirvlib = null_dep
 endif
@@ -2077,6 +2107,17 @@ endif
 with_spirv_tools = get_option('spirv-tools') \
     .enable_if(with_clc, error_message : 'CLC requires SPIRV-Tools')
 
+# honeykrisp-h1-execution.md SS5.2: unlike dep_llvm/dep_clc/dep_llvmspirvlib
+# above (native-only precompiler-tool deps), dep_spirv_tools is ALSO a real
+# HOST-machine (cross Windows target) dependency -- src/compiler/spirv's
+# libvtn (SPIRV-to-NIR, needed at driver runtime by
+# src/vulkan/runtime/vk_shader_module.c, VERIFIED idep_vtn in
+# vulkan_runtime_deps) links it for the actual vulkan_asahi.dll, not just
+# for mesa_clc. Left host-machine (unpatched) on purpose: this is the
+# genuine remaining H1 blocker (no cross-compiled SPIRV-Tools for
+# aarch64-windows in this environment, no meson wrap available) -- see
+# BUILD-STATUS.md. Do NOT make this native: true, that would silently
+# swap in the wrong (build-machine) library for a host-machine target.
 dep_spirv_tools = dependency(
   'SPIRV-Tools',
   required : with_spirv_tools,

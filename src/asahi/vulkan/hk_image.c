@@ -15,6 +15,7 @@
 #include "vulkan/vulkan_core.h"
 
 #include "agx_bo.h"
+#include "hk_aurora_scanout.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
 #include "hk_device_memory.h"
@@ -22,6 +23,23 @@
 #include "hk_physical_device.h"
 
 #include "vk_format.h"
+
+/* Runtime-device bridge: a callback (bridge) allocation can never mint an
+ * hGlobalShare/NT handle, so a Win32 export is unsatisfiable in bridge mode
+ * (see the same note in hk_device_memory.c on hk_opaque_win32_mem_props).
+ * agx_d3dkmt_bridge.h provides agx_d3dkmt_bridge_enabled() -- the
+ * process-wide, env-gated bridge-requested predicate, valid at
+ * physical-device scope before any logical device (hence any per-device
+ * bridge registration) exists; agx_bridge_vma.h provides agx_bridge_valog().
+ * Both are overlay-only files, so __has_include keeps AGXKMD/Linux builds
+ * byte-identical. */
+#if defined(__has_include)
+#if __has_include("asahi/lib/agx_bridge_vma.h")
+#include "asahi/lib/agx_d3dkmt_bridge.h"
+#include "asahi/lib/agx_bridge_vma.h"
+#define HK_HAVE_BRIDGE_EXPORT_SUPPRESS 1
+#endif
+#endif
 
 /* Minimum alignment encodable for our descriptors. The hardware texture/PBE
  * descriptors require 16-byte alignment. Our software PBE atomic descriptor
@@ -33,6 +51,59 @@
  * alignment 65k.
  */
 #define HK_SPARSE_ALIGN_B 65536
+
+struct hk_aurora_tight_linear_image_create_info {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t version;
+   uint32_t flags;
+   VkDeviceSize row_pitch_B;
+};
+
+static const struct hk_aurora_tight_linear_image_create_info *
+hk_get_aurora_tight_linear_info(const void *pNext)
+{
+   const VkBaseInStructure *ext = pNext;
+
+   if (ext != NULL &&
+       (uint32_t)ext->sType == HK_AURORA_TIGHT_LINEAR_IMAGE_STYPE)
+      return (const struct hk_aurora_tight_linear_image_create_info *)ext;
+
+   return NULL;
+}
+
+static VkResult
+hk_validate_aurora_tight_linear_info(
+   struct hk_device *dev, const VkImageCreateInfo *info,
+   const struct hk_aurora_tight_linear_image_create_info *aurora,
+   uint32_t *stride_B_out)
+{
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   const bool bgra = info->format == VK_FORMAT_B8G8R8A8_UNORM ||
+                     info->format == VK_FORMAT_B8G8R8A8_SRGB;
+
+   if (aurora->version != HK_AURORA_TIGHT_LINEAR_IMAGE_VERSION ||
+       aurora->flags != 0 || info->tiling != VK_IMAGE_TILING_LINEAR ||
+       info->imageType != VK_IMAGE_TYPE_2D || !bgra ||
+       info->extent.width == 0 || info->extent.height == 0 ||
+       info->extent.depth != 1 || info->mipLevels != 1 ||
+       info->arrayLayers != 1 || info->samples != VK_SAMPLE_COUNT_1_BIT ||
+       (info->flags & ~allowed_flags) != 0 ||
+       (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0 ||
+       (info->usage & ~allowed_usage) != 0 ||
+       info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED ||
+       !hk_aurora_tight_linear_stride(info->extent.width, 4,
+                                      aurora->row_pitch_B, stride_B_out))
+      return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                       "invalid Aurora tight-linear scanout image");
+
+   return VK_SUCCESS;
+}
 
 static VkFormatFeatureFlags2
 hk_get_image_plane_format_features(struct hk_physical_device *pdev,
@@ -526,6 +597,16 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          ext_mem_props = &hk_dma_buf_mem_props;
          break;
 
+#ifdef _WIN32
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+         ext_mem_props = &hk_opaque_win32_mem_props;
+         break;
+
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+         ext_mem_props = &hk_opaque_win32_kmt_mem_props;
+         break;
+#endif
+
       default:
          /* From the Vulkan 1.3.256 spec:
           *
@@ -592,8 +673,45 @@ hk_GetPhysicalDeviceImageFormatProperties2(
           *
           * This is true if and only if ext_mem_props == NULL
           */
-         if (ext_mem_props != NULL)
+         if (ext_mem_props != NULL) {
             p->externalMemoryProperties = *ext_mem_props;
+#ifdef HK_HAVE_BRIDGE_EXPORT_SUPPRESS
+            /* In bridge mode, advertise the Win32 handle types as
+             * import-only: dropping EXPORTABLE makes DXVK's canShareImage()
+             * fail for an export-mode shared image, so the image is created
+             * as a plain local allocation (its VkExportMemoryAllocateInfo is
+             * never chained and the allocation succeeds) instead of failing
+             * image storage outright. The fork's eager
+             * vkGetMemoryWin32HandleKHR redemption then returns
+             * VK_ERROR_INVALID_EXTERNAL_HANDLE and DXVK treats it as a
+             * harmless warn. Cross-process sharing in bridge mode flows
+             * through the runtime-resource handoff (a private pNext), which
+             * never consults these caps, so it is unaffected. Imports keep
+             * IMPORTABLE. */
+            if (external_info != NULL &&
+                (external_info->handleType ==
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+                 external_info->handleType ==
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT) &&
+                agx_d3dkmt_bridge_enabled() &&
+                getenv("AGX_WIN32_EXPORT_SUPPRESS") != NULL) {
+               p->externalMemoryProperties.externalMemoryFeatures &=
+                  ~(VkExternalMemoryFeatureFlags)
+                     VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+               p->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+               static unsigned hk_win32_suppress_logged;
+               if (hk_win32_suppress_logged < 8u) {
+                  hk_win32_suppress_logged++;
+                  agx_bridge_valog(
+                     "HK WIN32-EXPORT-SUPPRESS handleType=0x%x -> "
+                     "import-only (bridge cannot mint a Win32 share; "
+                     "DXVK canShareImage() degrades this to a plain "
+                     "local image)",
+                     (unsigned)external_info->handleType);
+               }
+            }
+#endif
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
@@ -798,7 +916,27 @@ static VkResult
 hk_image_init(struct hk_device *dev, struct hk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
+   const struct hk_aurora_tight_linear_image_create_info *aurora =
+      hk_get_aurora_tight_linear_info(pCreateInfo->pNext);
+   VkImageCreateInfo common_info;
+   uint32_t aurora_stride_B = 0;
+
+   /* Consume and validate the private record before the common image runtime
+    * sees the chain. The contract is deliberately narrower than Vulkan's
+    * ordinary linear-image rules and never changes their layout policy. */
+   if (aurora != NULL) {
+      VkResult result = hk_validate_aurora_tight_linear_info(
+         dev, pCreateInfo, aurora, &aurora_stride_B);
+      if (result != VK_SUCCESS)
+         return result;
+
+      common_info = *pCreateInfo;
+      common_info.pNext = aurora->pNext;
+      pCreateInfo = &common_info;
+   }
+
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+   image->aurora_tight_linear = aurora != NULL;
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
@@ -833,6 +971,19 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    const struct VkImageDrmFormatModifierExplicitCreateInfoEXT
       *mod_explicit_info = NULL;
 
+   /* BUILD-STATUS.md stage-2: struct vk_image's `drm_format_mod` field
+    * (src/vulkan/runtime/vk_image.h) only exists under
+    * `#if DETECT_OS_LINUX || DETECT_OS_BSD` -- VK_EXT_drm_format_modifier
+    * is inherently a Linux/BSD DRM-interop extension, so upstream Mesa
+    * never compiles the field in on Windows. VERIFIED (grep) every
+    * `drm_format_mod` reference anywhere under src/asahi/ is local to
+    * this one function, so a local shadow variable is sufficient; the
+    * write-through to `image->vk.drm_format_mod` is kept, guarded, for
+    * the Linux/BSD build where the field is real (unchanged behavior
+    * there).
+    */
+   uint64_t drm_format_mod = DRM_FORMAT_MOD_INVALID;
+
    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       assert(!image->vk.wsi_legacy_scanout);
       mod_explicit_info = vk_find_struct_const(
@@ -855,8 +1006,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       }
 
       assert(modifier != DRM_FORMAT_MOD_INVALID);
-      assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      assert(drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      drm_format_mod = modifier;
+#if DETECT_OS_LINUX || DETECT_OS_BSD
       image->vk.drm_format_mod = modifier;
+#endif
    }
 
    const struct vk_format_ycbcr_info *ycbcr_info =
@@ -874,16 +1028,15 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       const uint8_t height_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[1] : 1;
 
-      uint32_t linear_stride_B = 0;
-      if (mod_explicit_info &&
-          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR)
+      uint32_t linear_stride_B = aurora_stride_B;
+      if (mod_explicit_info && drm_format_mod == DRM_FORMAT_MOD_LINEAR)
          linear_stride_B = mod_explicit_info->pPlaneLayouts[plane].rowPitch;
 
       bool compressed =
-         hk_map_compression(dev, pCreateInfo, plane, image->vk.drm_format_mod);
+         hk_map_compression(dev, pCreateInfo, plane, drm_format_mod);
 
       image->planes[plane].layout = (struct ail_layout){
-         .tiling = hk_map_tiling(dev, pCreateInfo, image->vk.drm_format_mod),
+         .tiling = hk_map_tiling(dev, pCreateInfo, drm_format_mod),
          .compressed = compressed,
          .mipmapped_z = pCreateInfo->imageType == VK_IMAGE_TYPE_3D,
          .format = hk_format_to_pipe_format(format),

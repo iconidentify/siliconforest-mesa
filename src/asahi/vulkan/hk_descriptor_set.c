@@ -16,6 +16,7 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_image_view.h"
+#include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
 
@@ -50,6 +51,24 @@ write_desc(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
    void *dst = desc_ubo_data(set, binding, elem, &dst_size);
    assert(desc_size <= dst_size);
    memcpy(dst, desc_data, desc_size);
+}
+
+static void
+write_range(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
+            uint64_t addr, uint64_t range)
+{
+   const struct hk_descriptor_set_binding_layout *binding_layout =
+      &set->layout->binding[binding];
+
+   if (binding_layout->write_range_index == UINT32_MAX)
+      return;
+
+   uint64_t index = (uint64_t)binding_layout->write_range_index + elem;
+   assert(index < set->write_range_count);
+   set->write_ranges[index] = (struct hk_addr_range){
+      .addr = addr,
+      .range = range,
+   };
 }
 
 static void
@@ -153,9 +172,16 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
 
       desc.tex = view->planes[plane].ro_storage;
       desc.pbe = view->planes[plane].storage;
+
+      struct hk_image *image =
+         container_of(view->vk.image, struct hk_image, vk);
+      const unsigned image_plane = view->planes[plane].image_plane;
+      write_range(set, binding, elem, image->planes[image_plane].addr,
+                  image->planes[image_plane].layout.size_B);
    } else {
       agx_set_null_texture(&desc.tex);
       agx_set_null_pbe(&desc.pbe);
+      write_range(set, binding, elem, 0, 0);
    }
 
    write_desc(set, binding, elem, &desc, sizeof(desc));
@@ -183,6 +209,8 @@ write_buffer_desc(struct hk_descriptor_set *set,
    const struct hk_buffer_address desc = get_buffer_address(info, read_only);
 
    write_desc(set, binding, elem, &desc, sizeof(desc));
+   write_range(set, binding, elem, read_only ? 0 : desc.base_addr,
+               read_only ? 0 : desc.size);
 }
 
 static void
@@ -197,6 +225,8 @@ write_dynamic_buffer_desc(struct hk_descriptor_set *set,
       &set->dynamic_buffers[binding_layout->dynamic_buffer_index + elem];
 
    *desc = get_buffer_address(info, read_only);
+   write_range(set, binding, elem, read_only ? 0 : desc->base_addr,
+               read_only ? 0 : desc->size);
 }
 
 static void
@@ -210,9 +240,12 @@ write_buffer_view_desc(struct hk_descriptor_set *set,
 
       desc.tex = view->tex;
       desc.pbe = view->pbe;
+      write_range(set, binding, elem, view->write_range.addr,
+                  view->write_range.range);
    } else {
       agx_set_null_texture(&desc.tex);
       agx_set_null_pbe(&desc.pbe);
+      write_range(set, binding, elem, 0, 0);
    }
 
    write_desc(set, binding, elem, &desc, sizeof(desc));
@@ -326,6 +359,23 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
          }
       }
 
+      if (src_binding_layout->write_range_index != UINT32_MAX &&
+          dst_binding_layout->write_range_index != UINT32_MAX) {
+         for (uint32_t j = 0; j < copy->descriptorCount; j++) {
+            uint32_t src_index = src_binding_layout->write_range_index +
+                                 copy->srcArrayElement + j;
+            uint32_t dst_index = dst_binding_layout->write_range_index +
+                                 copy->dstArrayElement + j;
+            assert(src_index < src->write_range_count);
+            assert(dst_index < dst->write_range_count);
+            dst->write_ranges[dst_index] = src->write_ranges[src_index];
+         }
+      } else if (dst_binding_layout->write_range_index != UINT32_MAX) {
+         for (uint32_t j = 0; j < copy->descriptorCount; j++)
+            write_range(dst, copy->dstBinding,
+                        copy->dstArrayElement + j, 0, 0);
+      }
+
       if (vk_descriptor_type_is_dynamic(src_binding_layout->type)) {
          const uint32_t dst_dyn_start =
             dst_binding_layout->dynamic_buffer_index + copy->dstArrayElement;
@@ -349,7 +399,10 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
       .layout = layout,
       .size = sizeof(push_set->data),
       .mapped_ptr = push_set->data,
+      .write_ranges = push_set->write_ranges,
+      .write_range_count = ARRAY_SIZE(push_set->write_ranges),
    };
+   push_set->layout = layout;
 
    for (uint32_t w = 0; w < write_count; w++) {
       const VkWriteDescriptorSet *write = &writes[w];
@@ -411,6 +464,7 @@ hk_descriptor_set_destroy(struct hk_device *dev,
    list_del(&set->link);
    if (set->size > 0)
       hk_descriptor_pool_free(pool, set->addr, set->size);
+   vk_free(&dev->vk.alloc, set->write_ranges);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
 
    vk_object_free(&dev->vk, NULL, set);
@@ -491,7 +545,7 @@ hk_CreateDescriptorPool(VkDevice _device,
    if (bo_size) {
       pool->bo = agx_bo_create(&dev->dev, bo_size, 0, 0, "Descriptor pool");
       if (!pool->bo) {
-         hk_destroy_descriptor_pool(dev, pAllocator, pool);
+         vk_object_free(&dev->vk, pAllocator, pool);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
 
@@ -557,6 +611,18 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
    if (!set)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   set->write_range_count = layout->write_range_count;
+   if (set->write_range_count > 0) {
+      set->write_ranges = vk_zalloc(
+         &dev->vk.alloc,
+         (size_t)set->write_range_count * sizeof(*set->write_ranges),
+         8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (set->write_ranges == NULL) {
+         vk_object_free(&dev->vk, NULL, set);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
    set->size = layout->non_variable_descriptor_buffer_size;
 
    if (layout->binding_count > 0 &&
@@ -576,6 +642,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
       result = hk_descriptor_pool_alloc(pool, set->size, HK_MIN_UBO_ALIGNMENT,
                                         &set->addr, &set->mapped_ptr);
       if (result != VK_SUCCESS) {
+         vk_free(&dev->vk.alloc, set->write_ranges);
          vk_object_free(&dev->vk, NULL, set);
          return result;
       }
@@ -801,6 +868,9 @@ hk_push_descriptor_set_update_template(
       .layout = layout,
       .size = sizeof(push_set->data),
       .mapped_ptr = push_set->data,
+      .write_ranges = push_set->write_ranges,
+      .write_range_count = ARRAY_SIZE(push_set->write_ranges),
    };
+   push_set->layout = layout;
    hk_descriptor_set_write_template(&tmp_set, template, data);
 }

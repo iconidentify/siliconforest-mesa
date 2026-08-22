@@ -90,7 +90,7 @@ struct hk_device {
     * expected to be a legitimate problem. If it is, we can rework later.
     */
    struct agx_bo *heap;
-   util_once_flag heap_init_once;
+   simple_mtx_t heap_lock;
 
    struct {
       struct agx_scratch vs, fs, cs;

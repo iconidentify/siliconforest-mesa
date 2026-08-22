@@ -5,6 +5,8 @@
 
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
+#include <stdlib.h>
+#include <stdio.h>
 
 /* Binary patches needed for branch offsets */
 struct agx_branch_fixup {
@@ -22,9 +24,45 @@ static void
 pack_assert_internal(const agx_instr *I, bool condition, const char *msg)
 {
    if (!condition) {
-      fprintf(stderr, "Packing assertion failed for instruction:\n\n");
-      agx_print_instr(I, stderr);
-      fprintf(stderr, "\n%s\n", msg);
+      FILE *out = stderr;
+
+#ifdef _WIN32
+      /* A Vulkan ICD is loaded INTO its host process, so abort() here kills
+       * whatever is rendering -- and when that host is dwm.exe, it kills the
+       * desktop.  Measured on J414s 2026-08-18: dwm.exe crash-looping every
+       * ~19s, every captured stack identical, ending in
+       * ucrtbase!abort+0x3c with the message "I->shift <= 4".
+       *
+       * Two things made that near-impossible to attribute:
+       *   - the diagnostic goes to stderr, and a compositor has no stderr,
+       *     so the one message naming the instruction was discarded; and
+       *   - pack_assert is ALWAYS ON (it is not the C assert() and NDEBUG
+       *     does not remove it), so a release build still aborts.
+       *
+       * Write the instruction dump somewhere a driver can actually be
+       * debugged from, and do NOT abort by default.  A malformed instruction
+       * is a real defect and the log says exactly which one, but failing one
+       * shader must not be fatal to the process that asked for it.  Set
+       * AGX_PACK_ASSERT_FATAL=1 to restore the abort for local debugging.
+       */
+      FILE *log = fopen("C:\\aurora\\logs\\agx-pack-assert.log", "a");
+
+      if (log != NULL)
+         out = log;
+#endif
+
+      fprintf(out, "Packing assertion failed for instruction:\n\n");
+      agx_print_instr(I, out);
+      fprintf(out, "\n%s\n", msg);
+
+#ifdef _WIN32
+      if (out != stderr) {
+         fflush(out);
+         fclose(out);
+      }
+      if (getenv("AGX_PACK_ASSERT_FATAL") == NULL)
+         return;
+#endif
       abort();
    }
 }
@@ -451,8 +489,28 @@ agx_pack_alu(struct util_dynarray *emission, agx_instr *I)
       unsigned src_extend = (src >> 10);
 
       /* Size bit always zero and so omitted for 16-bit */
-      if (is_f16 && !is_cmpsel)
-         pack_assert(I, (src_short & (1 << 9)) == 0);
+      if (is_f16 && !is_cmpsel && (src_short & (1 << 9)) != 0) {
+         /* Bit 9 is the source size flag, and for an f16 op it is reused as
+          * the float-modifier bit below (fmod_offset == 9).  A 32-bit source
+          * on a 16-bit float op therefore has no encoding at all.
+          *
+          * Something upstream really does emit this -- measured on J414s:
+          *   $r1h = hmul $r1l, ^r2      (r2 is 32-bit)
+          * Neither optimizer path is responsible: agx_optimizer_fmov
+          * explicitly refuses to fold a 32-bit def into a 16-bit use, and
+          * copyprop's size guard rejects it too.
+          *
+          * Report it (pack_assert_internal now logs to a file and does not
+          * abort), then force the field well-formed.  Leaving bit 9 set does
+          * NOT harmlessly pass the problem through -- it corrupts the float
+          * modifier of a live instruction, and feeding the GPU an instruction
+          * whose modifier bits are garbage risks a fault or hang, which is
+          * worse than a wrong pixel.  Clearing it encodes a legal 16-bit
+          * source: arithmetically wrong for this operand, but decodable.
+          */
+         pack_assert(I, false);
+         src_short &= ~(1u << 9);
+      }
 
       if (info.is_float || (I->op == AGX_OPCODE_FCMPSEL && !is_cmpsel)) {
          unsigned fmod = agx_pack_float_mod(I->src[s]);

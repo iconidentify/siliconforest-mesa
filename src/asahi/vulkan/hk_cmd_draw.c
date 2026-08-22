@@ -435,7 +435,7 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&dev->bg_eot, &key);
 
    agx_usc_pack(&b, SHADER, cfg) {
-      cfg.code = agx_usc_addr(&dev->dev, shader->ptr);
+      cfg.code = agx_usc_addr(&dev->dev, shader->ptr + shader->info.main_offset);
       cfg.unk_2 = 0;
    }
 
@@ -985,35 +985,44 @@ hk_CmdEndRendering(VkCommandBuffer commandBuffer)
    }
 }
 
-static void
-hk_init_heap(const void *data)
-{
-   struct hk_cmd_buffer *cmd = (struct hk_cmd_buffer *)data;
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-
-   perf_debug(cmd, "Allocating heap");
-
-   size_t size = 128 * 1024 * 1024;
-   dev->heap = agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
-
-   /* The geometry state buffer is initialized here and then is treated by
-    * the CPU as rodata, even though the GPU uses it for scratch internally.
-    */
-   off_t off = dev->rodata.heap - dev->rodata.bo->va->addr;
-   struct poly_heap *map = agx_bo_map(dev->rodata.bo) + off;
-
-   *map = (struct poly_heap){
-      .base = dev->heap->va->addr,
-      .size = size,
-   };
-}
-
 static uint64_t
 hk_heap(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const size_t size = 128 * 1024 * 1024;
 
-   util_call_once_data(&dev->heap_init_once, hk_init_heap, cmd);
+   /* A once flag is wrong here: it publishes completion even if BO allocation
+    * fails, making a transient OOM both non-retryable and an immediate NULL
+    * dereference. Serialize publication explicitly and leave the pointer NULL
+    * on failure so a later command buffer may retry after memory is reclaimed.
+    */
+   simple_mtx_lock(&dev->heap_lock);
+   if (dev->heap == NULL) {
+      perf_debug(cmd, "Allocating heap");
+
+      struct agx_bo *heap =
+         agx_bo_create(&dev->dev, size, 0, 0, "Geometry heap");
+      if (unlikely(heap == NULL)) {
+         simple_mtx_unlock(&dev->heap_lock);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return 0;
+      }
+
+      /* The geometry state buffer is initialized here and then is treated by
+       * the CPU as rodata, even though the GPU uses it for scratch internally.
+       * Publish the descriptor before publishing the BO pointer.
+       */
+      off_t off = dev->rodata.heap - dev->rodata.bo->va->addr;
+      struct poly_heap *map = agx_bo_map(dev->rodata.bo) + off;
+
+      *map = (struct poly_heap){
+         .base = heap->va->addr,
+         .size = size,
+      };
+      dev->heap = heap;
+   }
+   simple_mtx_unlock(&dev->heap_lock);
 
    /* We need to free all allocations after each command buffer execution */
    if (!cmd->uses_heap) {
@@ -1204,7 +1213,8 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    if (indirect) {
       if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          /* Need to allocate heap if we haven't yet */
-         hk_heap(cmd);
+         if (unlikely(hk_heap(cmd) == 0))
+            return 0;
 
          cmd->geom_index_buffer = dev->heap->va->addr;
          cmd->geom_index_count = dev->heap->size;
@@ -1250,6 +1260,10 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_shader *tcs = hk_only_variant(gfx->shaders[MESA_SHADER_TESS_CTRL]);
 
+   uint64_t heap = hk_heap(cmd);
+   if (unlikely(heap == 0))
+      return;
+
    enum poly_tess_partitioning partitioning =
       gfx->tess.info.spacing == TESS_SPACING_EQUAL
          ? POLY_TESS_PARTITIONING_INTEGER
@@ -1258,7 +1272,7 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out,
          : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
 
    struct poly_tess_params args = {
-      .heap = hk_heap(cmd),
+      .heap = heap,
       .tcs_stride_el = tcs->info.tess.tcs_output_stride / 4,
       .statistic = hk_pipeline_stat_addr(
          cmd,
@@ -1419,13 +1433,17 @@ hk_draw_without_restart(struct hk_cmd_buffer *cmd, struct agx_draw draw,
    /* The unroll kernel assumes an indirect draw. Synthesize one if needed */
    draw = hk_draw_as_indexed_indirect(cmd, draw);
 
+   uint64_t heap = hk_heap(cmd);
+   if (unlikely(heap == 0))
+      return draw;
+
    /* Next, we unroll the index buffer used by the indirect draw */
    enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
 
    assert(draw_count == 1 && "TODO: multidraw");
 
    struct libagx_unroll_restart_args ia = {
-      .heap = hk_heap(cmd),
+      .heap = heap,
       .index_buffer = draw.index_buffer,
       .in_draw = draw.b.ptr,
       .out_draw = hk_pool_alloc(cmd, 5 * sizeof(uint32_t) * draw_count, 4).gpu,
@@ -1477,13 +1495,20 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (draw.restart) {
       draw = hk_draw_without_restart(cmd, draw, 1);
+      if (unlikely(vk_command_buffer_get_record_result(&cmd->vk) !=
+                   VK_SUCCESS))
+         return draw;
       mode = u_decomposed_prim(mode);
    }
 
    /* Setup grids */
    if (agx_is_indirect(draw.b)) {
+      uint64_t heap = hk_heap(cmd);
+      if (unlikely(heap == 0))
+         return draw;
+
       struct libagx_gs_setup_indirect_args gsi = {
-         .heap = hk_heap(cmd),
+         .heap = heap,
          .index_buffer = draw.index_buffer,
          .draw = draw.b.ptr,
          .vp = desc->root.draw.vertex_params,
@@ -3074,6 +3099,9 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       gfx->descriptors.root.draw.geometry_params =
          hk_upload_geometry_params(cmd, draw);
 
+      if (unlikely(gfx->descriptors.root.draw.geometry_params == 0))
+         return;
+
       gfx->descriptors.root_dirty = true;
    }
 
@@ -3092,6 +3120,9 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        */
       if (tess_args.cpu) {
          hk_upload_tess_params(cmd, tess_args.cpu, draw);
+         if (unlikely(vk_command_buffer_get_record_result(&cmd->vk) !=
+                      VK_SUCCESS))
+            return;
       }
    }
 
@@ -3363,6 +3394,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       hk_flush_index(cmd, cs);
 
    hk_flush_dynamic_state(cmd, cs, draw_id, draw);
+   if (unlikely(vk_command_buffer_get_record_result(&cmd->vk) != VK_SUCCESS))
+      return NULL;
+
    return cs;
 }
 
@@ -3530,6 +3564,36 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       if (!cs)
          return;
 
+      for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+           stage <= MESA_SHADER_MESH; stage++) {
+         if (stage == MESA_SHADER_COMPUTE || stage == MESA_SHADER_KERNEL)
+            continue;
+         struct hk_api_shader *api = cmd->state.gfx.shaders[stage];
+         if (api == NULL)
+            continue;
+
+         struct hk_shader *shader = hk_any_variant(api);
+         enum hk_cs_write_pipe pipe = stage == MESA_SHADER_FRAGMENT
+                                         ? HK_CS_WRITE_FRAGMENT
+                                         : HK_CS_WRITE_VERTEX;
+         if (shader->info.descriptor_writes) {
+            hk_cs_track_descriptor_writes(
+               cs, &cmd->state.gfx.descriptors, pipe);
+         }
+         if (shader->info.untracked_writes)
+            hk_cs_mark_write_set_incomplete(cs, pipe);
+      }
+
+      if (cmd->state.gfx.xfb_enabled) {
+         for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.gfx.xfb); i++) {
+            const struct hk_addr_range *range = &cmd->state.gfx.xfb[i];
+            if (range->addr && range->range) {
+               hk_cs_track_attachment(cs, HK_CS_WRITE_VERTEX,
+                                      range->addr, range->range);
+            }
+         }
+      }
+
       struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
       bool geom = cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY];
       bool tess = cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
@@ -3546,6 +3610,11 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
       if (tess && HK_PERF(dev, NOTESS))
          continue;
 
+      /* ISP writes the device occlusion table directly, outside shader image
+       * stores. Carry that exact BO as a fragment attachment whenever this
+       * control stream actually executes a draw with visibility counting. */
+      cs->writes_occlusion_queries |=
+         cmd->state.gfx.occlusion.mode != AGX_VISIBILITY_MODE_NONE;
       cs->stats.calls++;
 
       if (geom || tess) {
@@ -3567,6 +3636,9 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 
       if (geom) {
          draw = hk_launch_gs_prerast(cmd, ccs, draw);
+         if (unlikely(vk_command_buffer_get_record_result(&cmd->vk) !=
+                      VK_SUCCESS))
+            return;
       }
 
       if (adj) {
@@ -3575,6 +3647,9 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 
          if (draw.restart) {
             draw = hk_draw_without_restart(cmd, draw, 1);
+            if (unlikely(vk_command_buffer_get_record_result(&cmd->vk) !=
+                         VK_SUCCESS))
+               return;
             prim = u_decomposed_prim(prim);
          }
 
@@ -3614,9 +3689,12 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_)
 
          size_t size_B = libagx_draw_robust_index_vdm_size();
          uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
+         uint64_t heap = hk_heap(cmd);
+         if (unlikely(heap == 0))
+            return;
 
          libagx_draw_robust_index(cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX,
-                                  target, hk_heap(cmd), draw.b.ptr,
+                                  target, heap, draw.b.ptr,
                                   draw.index_buffer, draw.index_buffer_range_B,
                                   draw.restart, topology, draw.index_size);
       } else {

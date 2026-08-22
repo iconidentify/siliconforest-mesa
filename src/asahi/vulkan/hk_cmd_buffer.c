@@ -35,6 +35,8 @@
 #include "util/u_dynarray.h"
 #include "vulkan/vulkan_core.h"
 
+#include <stdio.h>
+
 static void
 hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
                          struct hk_descriptor_state *desc)
@@ -194,11 +196,24 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
       uint32_t flags = usc ? AGX_BO_LOW_VA : 0;
       struct agx_bo *bo =
          agx_bo_create(&dev->dev, size, flags, 0, "Large pool allocation");
+      if (unlikely(bo == NULL)) {
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return (struct agx_ptr){0};
+      }
+
+      void *map = agx_bo_map(bo);
+      if (unlikely(map == NULL)) {
+         agx_bo_unreference(&dev->dev, bo);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_MEMORY_MAP_FAILED);
+         return (struct agx_ptr){0};
+      }
 
       util_dynarray_append(&cmd->large_bos, bo);
       return (struct agx_ptr){
          .gpu = bo->va->addr,
-         .cpu = agx_bo_map(bo),
+         .cpu = map,
       };
    }
 
@@ -404,6 +419,7 @@ hk_bind_descriptor_sets(UNUSED struct hk_cmd_buffer *cmd,
 
          /* Binding descriptors invalidates push descriptors */
          desc->push_dirty &= ~BITFIELD_BIT(s);
+         desc->push_active &= ~BITFIELD_BIT(s);
       }
 
       desc->root.set_dynamic_buffer_start[s] = dyn_buffer_start;
@@ -490,6 +506,7 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    /* Pushing descriptors replaces whatever sets are bound */
    desc->sets[set] = NULL;
    desc->push_dirty |= BITFIELD_BIT(set);
+   desc->push_active |= BITFIELD_BIT(set);
 
    return desc->push[set];
 }
@@ -778,6 +795,188 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                                prog->b.workgroup);
 }
 
+static struct hk_cs_write_tracker *
+hk_cs_write_tracker(struct hk_cs *cs, enum hk_cs_write_pipe pipe)
+{
+   switch (pipe) {
+   case HK_CS_WRITE_VERTEX:
+      return &cs->vertex_writes;
+   case HK_CS_WRITE_FRAGMENT:
+      return &cs->fragment_writes;
+   case HK_CS_WRITE_COMPUTE:
+      return &cs->compute_writes;
+   default:
+      UNREACHABLE("invalid write pipe");
+   }
+}
+
+void
+hk_cs_mark_write_set_incomplete(struct hk_cs *cs, enum hk_cs_write_pipe pipe)
+{
+   hk_cs_write_tracker(cs, pipe)->incomplete = true;
+}
+
+void
+hk_cs_track_attachment(struct hk_cs *cs, enum hk_cs_write_pipe pipe,
+                       uint64_t pointer, uint64_t size)
+{
+   struct hk_cs_write_tracker *tracker = hk_cs_write_tracker(cs, pipe);
+
+   if (pointer == 0 || size == 0 || pointer > UINT64_MAX - size) {
+      tracker->incomplete = true;
+      return;
+   }
+
+   for (unsigned i = 0; i < tracker->attachment_count; i++) {
+      const struct hk_cs_attachment *att = &tracker->attachments[i];
+      if (att->pointer == pointer && att->size == size)
+         return;
+   }
+
+   if (tracker->attachment_count == HK_CS_MAX_ATTACHMENTS) {
+      tracker->incomplete = true;
+      return;
+   }
+
+   tracker->attachments[tracker->attachment_count++] =
+      (struct hk_cs_attachment){.pointer = pointer, .size = size};
+}
+
+static void
+hk_cs_track_descriptor_set(struct hk_cs_write_tracker *tracker,
+                           struct hk_descriptor_set *set)
+{
+   for (unsigned i = 0; i < tracker->set_count; i++) {
+      if (tracker->sets[i] == set)
+         return;
+   }
+
+   if (tracker->set_count == HK_CS_MAX_ATTACHMENTS) {
+      tracker->incomplete = true;
+      return;
+   }
+   tracker->sets[tracker->set_count++] = set;
+}
+
+static bool
+hk_descriptor_binding_has_live_range(const struct hk_descriptor_set *set,
+                                     unsigned binding)
+{
+   const struct hk_descriptor_set_binding_layout *layout =
+      &set->layout->binding[binding];
+   if (layout->write_range_index == UINT32_MAX)
+      return false;
+
+   for (unsigned i = 0; i < layout->array_size; i++) {
+      uint64_t index = (uint64_t)layout->write_range_index + i;
+      if (index >= set->write_range_count)
+         break;
+      if (set->write_ranges[index].addr && set->write_ranges[index].range)
+         return true;
+   }
+   return false;
+}
+
+void
+hk_cs_track_descriptor_writes(struct hk_cs *cs,
+                              struct hk_descriptor_state *desc,
+                              enum hk_cs_write_pipe pipe)
+{
+   struct hk_cs_write_tracker *tracker = hk_cs_write_tracker(cs, pipe);
+
+   for (unsigned s = 0; s < HK_MAX_SETS; s++) {
+      if (desc->push_active & BITFIELD_BIT(s)) {
+         const struct hk_push_descriptor_set *push = desc->push[s];
+         if (push == NULL || push->layout == NULL) {
+            tracker->incomplete = true;
+            continue;
+         }
+         for (unsigned b = 0; b < push->layout->binding_count; b++) {
+            const struct hk_descriptor_set_binding_layout *binding =
+               &push->layout->binding[b];
+            if (binding->write_range_index == UINT32_MAX)
+               continue;
+            for (unsigned i = 0; i < binding->array_size; i++) {
+               uint64_t index = (uint64_t)binding->write_range_index + i;
+               if (index >= ARRAY_SIZE(push->write_ranges)) {
+                  tracker->incomplete = true;
+                  break;
+               }
+               const struct hk_addr_range *range = &push->write_ranges[index];
+               if (range->addr && range->range)
+                  hk_cs_track_attachment(cs, pipe, range->addr, range->range);
+            }
+         }
+         continue;
+      }
+
+      struct hk_descriptor_set *set = desc->sets[s];
+      if (set == NULL)
+         continue;
+
+      bool has_queue_visible_range = false;
+      for (unsigned b = 0; b < set->layout->binding_count; b++) {
+         const struct hk_descriptor_set_binding_layout *binding =
+            &set->layout->binding[b];
+         if (binding->write_range_index == UINT32_MAX)
+            continue;
+
+         if (binding->flags &
+             (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+              VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT)) {
+            tracker->incomplete = true;
+            continue;
+         }
+         if (!hk_descriptor_binding_has_live_range(set, b))
+            continue;
+
+         /* Dynamic storage offsets are command state, while ordinary set
+          * contents are intentionally sampled at queue submit. A future ABI
+          * can carry per-bind dynamic snapshots; until then this rare case is
+          * explicitly incomplete rather than publishing the unoffset base. */
+         if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+            tracker->incomplete = true;
+         } else {
+            has_queue_visible_range = true;
+         }
+      }
+      if (has_queue_visible_range)
+         hk_cs_track_descriptor_set(tracker, set);
+   }
+}
+
+static void
+hk_cs_add_fragment_attachment(struct hk_cs *cs, struct hk_image_view *view)
+{
+   if (view == NULL)
+      return;
+
+   struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+
+   for (unsigned p = 0; p < view->plane_count; p++) {
+      unsigned plane = view->planes[p].image_plane;
+      uint64_t pointer = image->planes[plane].addr;
+      uint64_t size = image->planes[plane].layout.size_B;
+
+      if (pointer == 0 || size == 0 || pointer > UINT64_MAX - size)
+         continue;
+
+      hk_cs_track_attachment(cs, HK_CS_WRITE_FRAGMENT, pointer, size);
+   }
+}
+
+static void
+hk_cs_init_fragment_attachments(struct hk_cs *cs,
+                                struct hk_rendering_state *render)
+{
+   for (unsigned i = 0; i < render->color_att_count; i++)
+      hk_cs_add_fragment_attachment(cs, render->color_att[i].iview);
+
+   hk_cs_add_fragment_attachment(cs, render->depth_att.iview);
+   hk_cs_add_fragment_attachment(cs, render->stencil_att.iview);
+}
+
 void
 hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -785,6 +984,17 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    uint8_t *map = cs->current;
 
    cs->tib = render->tilebuffer;
+   hk_cs_init_fragment_attachments(cs, render);
+   if (hk_cmd_buffer_device(cmd)->dev.debug & AGX_DBG_RESOURCE) {
+      fprintf(stderr, "HK_FRAGMENT_ATTACHMENTS count=%u",
+              cs->fragment_writes.attachment_count);
+      for (unsigned i = 0; i < cs->fragment_writes.attachment_count; i++) {
+         fprintf(stderr, " [%u]=0x%llx+0x%llx", i,
+                 (unsigned long long)cs->fragment_writes.attachments[i].pointer,
+                 (unsigned long long)cs->fragment_writes.attachments[i].size);
+      }
+      fprintf(stderr, "\n");
+   }
 
    /* Assume this is not the first control stream of the render pass, so
     * initially use the partial background/EOT program and ZLS control.

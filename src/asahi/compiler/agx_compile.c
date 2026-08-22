@@ -1781,17 +1781,24 @@ static agx_instr *
 agx_emit_imadshl_agx(agx_builder *b, nir_alu_instr *alu, agx_index dst,
                      agx_index s0, agx_index s1, agx_index s2, agx_index s3)
 {
-   /* If the shift is not constant, use a variable shift. This should never
-    * happen in practice but we don't want to constrain the NIR.
+   /* The immediate iadd/imad encoding accepts only shifts 0..4.  NIR normally
+    * guarantees that domain, but this backend is also a process boundary for
+    * arbitrary SPIR-V/DXIL-derived shaders.  Keep every out-of-domain value
+    * on the general shift path instead of letting the packer's always-live
+    * domain check abort a release process.
     */
    unsigned shift;
-   if (!nir_src_is_const(alu->src[3].src)) {
+   bool constant_shift = nir_src_is_const(alu->src[3].src);
+
+   if (constant_shift)
+      shift = nir_alu_src_as_uint(alu->src[3]);
+
+   if (!constant_shift || shift > 4) {
       s2 = agx_bfi(b, agx_immediate(0), s2, s3, 0);
       shift = 0;
-   } else {
-      shift = nir_alu_src_as_uint(alu->src[3]);
    }
 
+   /* Only the immediate-encoding path reaches this assertion. */
    assert(shift <= 4 && "domain restriction on the input NIR");
 
    /* Emit iadd if possible, else imad */
@@ -1838,6 +1845,41 @@ agx_fminmax_to(agx_builder *b, agx_index dst, agx_index s0, agx_index s1,
     * handle denorms, but we were already lowered for that.
     */
    return agx_fcmpsel_to(b, dst, s0, s1, s0, s1, fcond);
+}
+
+/*
+ * A 16-bit float ALU op cannot encode a 32-bit source at all: bit 9 of the
+ * packed source is the size flag, and an f16 instruction reuses bit 9 as its
+ * float-modifier bit (agx_pack.c, fmod_offset == 9).  agx_pack.c therefore
+ * asserts (src_short & (1 << 9)) == 0 for every f16 source -- and that
+ * assertion is ALWAYS ON and ends in abort(), which for a Vulkan ICD aborts
+ * the host process.
+ *
+ * Measured on J414s 2026-08-18, out of dwm.exe's own shaders:
+ *
+ *     $r1h = hmul $r1l, ^r2
+ *     $r2l = hmul $r1l, ^r3
+ *     $r2h = hmul $r1l, ^r4
+ *
+ * one 16-bit scalar against three consecutive 32-bit registers -- a
+ * scalar x vec3, i.e. premultiplied alpha, which a compositor runs constantly.
+ *
+ * Narrow such a source explicitly instead of handing the packer something it
+ * cannot represent.  fmov with a 16-bit destination IS the f2f16 conversion
+ * (see the f2f16 case below, which lowers to exactly this), so this is the
+ * conversion NIR's own semantics call for rather than a reinterpretation.
+ * Immediates are left alone: their packing never sets the size flag.
+ */
+static agx_index
+agx_coerce_f16_src(agx_builder *b, agx_index src)
+{
+   if (src.size == AGX_SIZE_16 || src.type == AGX_INDEX_IMMEDIATE ||
+       src.type == AGX_INDEX_NULL)
+      return src;
+
+   agx_index tmp = agx_temp(b->shader, AGX_SIZE_16);
+   agx_fmov_to(b, tmp, src);
+   return tmp;
 }
 
 static agx_instr *
@@ -1896,19 +1938,23 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
 
    case nir_op_fadd:
       if (instr->def.bit_size == 16)
-         return agx_hadd_to(b, dst, s0, s1);
+         return agx_hadd_to(b, dst, agx_coerce_f16_src(b, s0),
+                            agx_coerce_f16_src(b, s1));
       else
          return agx_fadd_to(b, dst, s0, s1);
 
    case nir_op_fmul:
       if (instr->def.bit_size == 16)
-         return agx_hmul_to(b, dst, s0, s1);
+         return agx_hmul_to(b, dst, agx_coerce_f16_src(b, s0),
+                            agx_coerce_f16_src(b, s1));
       else
          return agx_fmul_to(b, dst, s0, s1);
 
    case nir_op_ffma:
       if (instr->def.bit_size == 16)
-         return agx_hfma_to(b, dst, s0, s1, s2);
+         return agx_hfma_to(b, dst, agx_coerce_f16_src(b, s0),
+                            agx_coerce_f16_src(b, s1),
+                            agx_coerce_f16_src(b, s2));
       else
          return agx_ffma_to(b, dst, s0, s1, s2);
 
@@ -2965,11 +3011,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
     */
    NIR_PASS(_, nir, agx_nir_lower_fminmax);
 
-   /* Force preamble generation for internal shaders since hk's meta copies
-    * depend on it for correctness with imgwblk intrinsics.
+   /* Internal shaders normally use the same preamble path. Honour the
+    * documented nopreamble diagnostic for them too so image-copy failures can
+    * be isolated from promoted texture/sampler state without a special build.
     */
-   if (preamble_size &&
-       (!(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal)) {
+   if (preamble_size && !(agx_compiler_debug & AGX_DBG_NOPREAMBLE)) {
       unsigned sizes[] = {
          *preamble_size,
          ts_count ? *ts_count : 1000 /* large finite */,
@@ -3507,8 +3553,30 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    bool selftest = false;
 #endif
 
+#ifdef _WIN32
+   /* "/dev/null" resolves to C:\dev\null on Windows, and fopen returns NULL
+    * unless C:\dev happens to exist -- the null device is spelled "NUL".
+    * agx2_disassemble fprintf()s to this handle unconditionally, so a NULL
+    * FILE* here is an access violation inside every shader compile. Guard the
+    * self-test on the handle rather than assuming it opened. */
+   if (selftest) {
+      FILE *probe = fopen("NUL", "w");
+      if (probe == NULL) {
+         fprintf(stderr, "agx_compile: no null device; skipping the "
+                         "disassembler self-test\n");
+         selftest = false;
+      } else {
+         fclose(probe);
+      }
+   }
+#endif
+
    if (dump_shaders || selftest) {
+#ifdef _WIN32
+      FILE *fp = selftest ? fopen("NUL", "w") : stdout;
+#else
       FILE *fp = selftest ? fopen("/dev/null", "w") : stdout;
+#endif
       bool errors =
          agx2_disassemble(binary->data + offset, binary->size - offset, fp);
 

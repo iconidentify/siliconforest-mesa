@@ -78,7 +78,8 @@ main(int argc, const char **argv)
          ++cursor;
 
       FILE *outputp = open_memstream(&output, &sz);
-      signed ret = agx2_disassemble_instr((void *)code, outputp, 0, false);
+      signed ret =
+         agx2_disassemble_instr((void *)code, outputp, 0, i, false);
       unsigned instr_len = abs(ret);
       fclose(outputp);
 

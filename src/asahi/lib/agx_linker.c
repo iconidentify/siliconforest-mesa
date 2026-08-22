@@ -4,8 +4,11 @@
  */
 
 #include "agx_linker.h"
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
+/* ntagx_bo_log_enabled() -- the readback below is gated on it. */
+#include "agx_bo.h"
 #include "util/ralloc.h"
 #include "agx_abi.h"
 #include "agx_compile.h"
@@ -122,7 +125,29 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
 
    linked->bo = agx_bo_create(dev, size, 0, AGX_BO_EXEC | AGX_BO_LOW_VA,
                               "Linked executable");
+   if (!linked->bo) {
+      fprintf(stderr,
+              "agx_fast_link: AGX_BO_EXEC|AGX_BO_LOW_VA allocation of %zu B "
+              "FAILED (shader_base=0x%" PRIx64 "). The USC VA heap is built "
+              "from the kernel's vm_start/vm_end/vm_kernel_min_size, so this "
+              "is where bad GET_PARAMS values first show up.\n",
+              size, dev->shader_base);
+      return;
+   }
+
    uint8_t *linked_map = agx_bo_map(linked->bo);
+   if (!linked_map) {
+      fprintf(stderr,
+              "agx_fast_link: mapping the %zu B executable BO FAILED "
+              "(va=0x%" PRIx64 ", handle=%u). The allocation succeeded, so "
+              "this is the kernel's GEM_MMAP path for an executable/low-VA "
+              "BO, not the VA heap.\n",
+              size, linked->bo->va ? linked->bo->va->addr : 0,
+              (unsigned)linked->bo->handle);
+      agx_bo_unreference(dev, linked->bo);
+      linked->bo = NULL;
+      return;
+   }
 
    size_t offset = 0;
 
@@ -180,6 +205,56 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    }
 
    assert(offset == size);
+
+   if (agx_bo_sync_for_device(linked->bo, 0, size)) {
+      agx_bo_unreference(dev, linked->bo);
+      linked->bo = NULL;
+      return;
+   }
+
+   /*
+    * READ THE LINKED EXECUTABLE BACK THROUGH ITS OWN MAPPING.
+    *
+    * This is the binary the CDM control stream actually points at -- measured
+    * on J414s, the stream's word at +0x004 resolved to the "Linked executable"
+    * BO, NOT the "Preamble" BO. The first readback landed in hk_upload_shader
+    * and therefore only ever covered the preamble, leaving the one that
+    * matters unverified. Different function, different BO, different upload.
+    *
+    * Userspace readback through the mapping Mesa already holds: no kernel
+    * physical read, so none of the cache-attribute hazard that bugchecked the
+    * machine twice applies here. Reading back through a write-combining
+    * mapping is slow; this runs once per link under a debug flag.
+    */
+   if (ntagx_bo_log_enabled()) {
+      const volatile uint32_t *rb = (const volatile uint32_t *)linked_map;
+      size_t words = size / 4;
+      size_t show = words < 32 ? words : 32;
+      size_t nonzero = 0;
+
+      for (size_t w = 0; w < words; w++)
+         if (rb[w] != 0)
+            nonzero++;
+
+      fprintf(stderr,
+              "NTAGX_UPLOAD: linked handle=%u gpu_va=0x%" PRIx64 " size=%zu  "
+              "%zu/%zu words non-zero\n",
+              (unsigned)linked->bo->handle,
+              linked->bo->va ? (uint64_t)linked->bo->va->addr : 0ull, size,
+              nonzero, words);
+      for (size_t w = 0; w < show; w += 8) {
+         fprintf(stderr, "NTAGX_UPLOAD: +0x%03zx ", w * 4);
+         for (size_t k = 0; k < 8 && (w + k) < show; k++)
+            fprintf(stderr, " %08x", rb[w + k]);
+         fprintf(stderr, "\n");
+      }
+      if (nonzero == 0)
+         fprintf(stderr,
+                 "NTAGX FATAL: the LINKED EXECUTABLE reads back as ALL ZEROES "
+                 "through its own mapping. This is the binary the CDM stream "
+                 "points at, so the USC would execute nothing: real dispatch, "
+                 "real time, no stores, no fault.\n");
+   }
 
    agx_pack(&linked->shader, USC_SHADER, cfg) {
       cfg.code = agx_usc_addr(dev, linked->bo->va->addr);

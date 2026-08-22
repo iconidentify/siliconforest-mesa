@@ -235,6 +235,16 @@ hk_GetPhysicalDeviceExternalBufferProperties(
       pExternalBufferProperties->externalMemoryProperties =
          hk_dma_buf_mem_props;
       return;
+#ifdef _WIN32
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+      pExternalBufferProperties->externalMemoryProperties =
+         hk_opaque_win32_mem_props;
+      return;
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+      pExternalBufferProperties->externalMemoryProperties =
+         hk_opaque_win32_kmt_mem_props;
+      return;
+#endif
    default:
       goto unsupported;
    }

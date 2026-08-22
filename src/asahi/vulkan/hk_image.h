@@ -75,6 +75,11 @@ struct hk_image {
 
    uint8_t plane_count;
    struct hk_image_plane planes[3];
+
+   /* This image passed the Aurora tight-linear scanout validation
+    * (hk_aurora_scanout.h).  Its dedicated device memory is created as the
+    * KMD's scanout-content donor. */
+   bool aurora_tight_linear;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)

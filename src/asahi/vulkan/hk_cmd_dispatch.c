@@ -95,6 +95,13 @@ dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
    if (!cs)
       return;
 
+   if (s->info.descriptor_writes) {
+      hk_cs_track_descriptor_writes(cs, &cmd->state.cs.descriptors,
+                                    HK_CS_WRITE_COMPUTE);
+   }
+   if (s->info.untracked_writes)
+      hk_cs_mark_write_set_incomplete(cs, HK_CS_WRITE_COMPUTE);
+
    struct agx_workgroup local_size =
       agx_workgroup(s->b.info.workgroup_size[0], s->b.info.workgroup_size[1],
                     s->b.info.workgroup_size[2]);

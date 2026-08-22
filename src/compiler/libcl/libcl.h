@@ -17,6 +17,24 @@
 
 #ifndef __OPENCL_VERSION__
 
+/* BUILD-STATUS.md stage-2 cross build: on the host side (this #ifndef
+ * branch), common host/device headers such as
+ * src/asahi/libagx/libagx_dgc.h use OpenCL C's builtin `uint` scalar type
+ * (no typedef needed under __OPENCL_VERSION__, where it's a language
+ * builtin). On Linux this happens to work by accident: glibc's
+ * sys/types.h (transitively included by something else in the TU) defines
+ * `uint` under _DEFAULT_SOURCE/_USE_MISC. mingw-w64 provides no such
+ * typedef anywhere, so plain-C (non-OpenCL) compiles of these shared
+ * headers fail with "use of undeclared identifier 'uint'" on Windows.
+ * Repeated typedefs of an identical type are valid C11 (6.7p3), so this is
+ * a no-op everywhere `uint` is already visible and a real fix only where
+ * it's missing -- scoped to mingw/Windows to keep the change minimal and
+ * not mask the same gap being absent on some other non-glibc libc.
+ */
+#if defined(_WIN32) || defined(__MINGW32__)
+typedef unsigned int uint;
+#endif
+
 /* Structures defined in common host/device headers that include device pointers
  * need to resolve to a real pointer in OpenCL but an opaque 64-bit address on
  * the host. The DEVICE macro facilitates that.

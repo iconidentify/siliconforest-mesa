@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <inttypes.h>
+#include <stdlib.h>
+
 #include "agx_bg_eot.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
@@ -31,6 +34,46 @@ lower_tex_handle_to_u0(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool
+agx_bg_eot_log_enabled(void)
+{
+#if AGX_GPU_DIAG >= 2
+   const char *value = getenv("NTAGX_BG_EOT_LOG");
+   return value != NULL && value[0] != '\0' && value[0] != '0';
+#else
+   return false;
+#endif
+}
+
+static uint32_t
+agx_bg_eot_hash(const volatile uint8_t *bytes, size_t size,
+                size_t *nonzero_out)
+{
+   uint32_t hash = UINT32_C(2166136261);
+   size_t nonzero = 0;
+
+   for (size_t i = 0; i < size; i++) {
+      uint8_t byte = bytes[i];
+      nonzero += byte != 0;
+      hash ^= byte;
+      hash *= UINT32_C(16777619);
+   }
+
+   *nonzero_out = nonzero;
+   return hash;
+}
+
+static void
+agx_bg_eot_print_head(const char *kind, const volatile uint8_t *bytes,
+                      size_t size)
+{
+   size_t show = MIN2(size, 32);
+   fprintf(stderr, "NTAGX_BG_EOT: %s head", kind);
+   for (size_t i = 0; i < show; i++)
+      fprintf(stderr, " %02x", bytes[i]);
+   fprintf(stderr, "\n");
+}
+
 static struct agx_bg_eot_shader *
 agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
                           struct agx_shader_key *key,
@@ -56,6 +99,51 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
    res->info = bin.info;
    res->ptr = agx_pool_upload_aligned_with_bo(
       &cache->pool, bin.binary, bin.info.binary_size, 128, &res->bo);
+
+   if (agx_bg_eot_log_enabled()) {
+      size_t size = bin.info.binary_size;
+      size_t offset = (res->bo != NULL && res->bo->va != NULL &&
+                       res->ptr >= res->bo->va->addr)
+                         ? (size_t)(res->ptr - res->bo->va->addr)
+                         : SIZE_MAX;
+      bool bounds_ok = bin.info.main_offset <= size &&
+                       bin.info.main_size <= size - bin.info.main_offset;
+      const volatile uint8_t *mapped =
+         (offset != SIZE_MAX && offset <= res->bo->size &&
+          size <= res->bo->size - offset)
+            ? (const volatile uint8_t *)agx_bo_map(res->bo) + offset
+            : NULL;
+      size_t source_nonzero = 0, mapped_nonzero = 0;
+      size_t source_main_nonzero = 0, mapped_main_nonzero = 0;
+      uint32_t source_hash = agx_bg_eot_hash(bin.binary, size,
+                                             &source_nonzero);
+      uint32_t mapped_hash = mapped != NULL
+                                ? agx_bg_eot_hash(mapped, size, &mapped_nonzero)
+                                : 0;
+      uint32_t source_main_hash = bounds_ok
+           ? agx_bg_eot_hash(bin.binary + bin.info.main_offset,
+                             bin.info.main_size, &source_main_nonzero) : 0;
+      uint32_t mapped_main_hash = bounds_ok && mapped != NULL
+           ? agx_bg_eot_hash(mapped + bin.info.main_offset,
+                             bin.info.main_size, &mapped_main_nonzero) : 0;
+
+      fprintf(stderr,
+              "NTAGX_BG_EOT: stage=%u handle=%u gpu=0x%" PRIx64
+              " bo_offset=0x%zx size=%zu main_offset=%u main_size=%u "
+              "source=%zu/%08x mapped=%zu/%08x "
+              "source_main=%zu/%08x mapped_main=%zu/%08x bounds=%u\n",
+              (unsigned)bin.info.stage,
+              res->bo != NULL ? (unsigned)res->bo->uapi_handle : 0,
+              res->ptr, offset, size, bin.info.main_offset,
+              bin.info.main_size, source_nonzero, source_hash,
+              mapped_nonzero, mapped_hash, source_main_nonzero,
+              source_main_hash, mapped_main_nonzero, mapped_main_hash,
+              bounds_ok ? 1u : 0u);
+      agx_bg_eot_print_head("source", bin.binary, size);
+      if (mapped != NULL)
+         agx_bg_eot_print_head("mapped", mapped, size);
+      fflush(stderr);
+   }
    free(bin.binary);
    ralloc_free(shader);
 

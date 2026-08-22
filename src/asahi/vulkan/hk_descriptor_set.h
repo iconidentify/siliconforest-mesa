@@ -83,6 +83,11 @@ struct hk_descriptor_set {
    uint64_t addr;
    uint32_t size;
 
+   /* Exact current ranges for storage descriptors. Descriptor bytes alone
+    * are deliberately not reverse-decoded at queue submit. */
+   struct hk_addr_range *write_ranges;
+   uint32_t write_range_count;
+
    struct hk_buffer_address dynamic_buffers[];
 };
 
@@ -97,6 +102,8 @@ hk_descriptor_set_addr(const struct hk_descriptor_set *set)
 
 struct hk_push_descriptor_set {
    uint8_t data[HK_PUSH_DESCRIPTOR_SET_SIZE];
+   struct hk_descriptor_set_layout *layout;
+   struct hk_addr_range write_ranges[HK_MAX_PUSH_DESCRIPTORS];
 };
 
 void hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,

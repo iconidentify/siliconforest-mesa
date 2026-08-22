@@ -24,11 +24,24 @@
 #include "vk_drm_syncobj.h"
 
 #include <sched.h>
+#ifdef HAVE_LIBDRM
 #include <xf86drm.h>
+#endif
 
 #include "drm-uapi/drm.h"
 
+/*
+ * honeykrisp-h1-execution.md SS3.3: libsync.h needs <poll.h>/<sys/ioctl.h>/
+ * <unistd.h> (util/libsync.h:33-40), none of which exist on Windows. Only
+ * the two fd/dma-buf-only fallback paths below (spin_wait_for_sync_file,
+ * vk_drm_copy_sync_file_payloads) use it -- both unreachable through the
+ * ntagx provider (it always advertises timeline support unconditionally,
+ * so vk_device_has_timeline_syncobj() is always true for it, VERIFIED
+ * these two are only called from the has-no-timeline branches below).
+ */
+#ifdef HAVE_LIBDRM
 #include "util/libsync.h"
+#endif
 #include "util/os_time.h"
 #include "util/u_sync_provider.h"
 
@@ -208,6 +221,18 @@ vk_drm_syncobj_reset_many(struct vk_device *device,
    return VK_SUCCESS;
 }
 
+/*
+ * honeykrisp-h1-execution.md SS3.3: sync_has_sync_file/spin_wait_for_sync_file
+ * are the "no timeline support" fd-spin fallback (only caller,
+ * vk_drm_syncobj_wait_many below, takes this path only when
+ * !VK_SYNC_FEATURE_TIMELINE) -- unreachable through the ntagx provider
+ * (SS3.1: timeline_signal/timeline_wait are unconditionally non-NULL
+ * there), and needs util/libsync.h's close()/sync_merge() POSIX surface.
+ * The !HAVE_LIBDRM stub keeps the call site in vk_drm_syncobj_wait_many
+ * unconditional (same rationale as agx_bo_import's Windows stub,
+ * agx_device.c SS2.1 row ":266...").
+ */
+#ifdef HAVE_LIBDRM
 static VkResult
 sync_has_sync_file(struct vk_device *device, struct vk_sync *sync)
 {
@@ -277,6 +302,19 @@ spin_wait_for_sync_file(struct vk_device *device,
 
    return VK_SUCCESS;
 }
+#else /* !HAVE_LIBDRM */
+static VkResult
+spin_wait_for_sync_file(struct vk_device *device,
+                        uint32_t wait_count,
+                        const struct vk_sync_wait *waits,
+                        enum vk_sync_wait_flags wait_flags,
+                        uint64_t abs_timeout_ns)
+{
+   return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                    "non-timeline WAIT_PENDING sync-file spin-wait "
+                    "unsupported (no libdrm)");
+}
+#endif /* HAVE_LIBDRM */
 
 static VkResult
 vk_drm_syncobj_wait_many(struct vk_device *device,
@@ -355,6 +393,10 @@ vk_drm_syncobj_wait_many(struct vk_device *device,
 
    if (err && errno == ETIME) {
       return VK_TIMEOUT;
+   } else if (err && errno == EIO) {
+      return vk_device_set_lost(
+         device,
+         "GPU output fence completed with a failed KMD outcome");
    } else if (err) {
       return vk_errorf(device, VK_ERROR_UNKNOWN,
                        "DRM_IOCTL_SYNCOBJ_WAIT failed: %m");
@@ -467,6 +509,14 @@ vk_drm_syncobj_move(struct vk_device *device,
    }
 }
 
+/*
+ * honeykrisp-h1-execution.md SS3.3: the sync-file merge path (sync_merge(),
+ * util/libsync.h-only). Only caller, vk_drm_syncobj_copy_payloads below,
+ * takes this branch only when !vk_device_has_timeline_syncobj(device) --
+ * unreachable through the ntagx provider (same reasoning as
+ * spin_wait_for_sync_file above). !HAVE_LIBDRM stub for the same reason.
+ */
+#ifdef HAVE_LIBDRM
 static VkResult
 vk_drm_copy_sync_file_payloads(struct vk_device *device,
                                uint32_t wait_count,
@@ -527,6 +577,19 @@ fail:
 
    return result;
 }
+#else /* !HAVE_LIBDRM */
+static VkResult
+vk_drm_copy_sync_file_payloads(struct vk_device *device,
+                               uint32_t wait_count,
+                               const struct vk_sync_wait *waits,
+                               uint32_t signal_count,
+                               const struct vk_sync_signal *signals)
+{
+   return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT,
+                    "non-timeline sync-file payload copy unsupported "
+                    "(no libdrm)");
+}
+#endif /* HAVE_LIBDRM */
 
 static VkResult
 vk_drm_syncobj_transfer_payloads(struct vk_device *device,

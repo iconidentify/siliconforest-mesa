@@ -157,9 +157,9 @@ struct disasm_spec decodings[] = {
 };
 
 signed
-agx2_disassemble_instr(BITSET_WORD *code, FILE *fp, unsigned offset, bool verbose)
+agx2_disassemble_instr(BITSET_WORD *code, FILE *fp, unsigned offset, size_t available, bool verbose)
 {
-  return _disassemble_instr(code, fp, decodings, ARRAY_SIZE(decodings), offset, verbose);
+  return _disassemble_instr(code, fp, decodings, ARRAY_SIZE(decodings), available, offset, verbose);
 }"""
 
 try:

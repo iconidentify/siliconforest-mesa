@@ -54,9 +54,19 @@ vulkan_lite_runtime_deps = [
   idep_vulkan_util,
 ]
 
-if dep_libdrm.found()
+# honeykrisp-h1-execution.md SS3.3: vk_drm_syncobj.c is provider-based
+# already (vk_drm_syncobj_get_type_from_provider, used by hk on both OSes,
+# SS3.3) -- build it whenever asahi's Vulkan driver is enabled even without
+# libdrm (Windows), not just when dep_libdrm.found(). The file itself gets
+# two HAVE_LIBDRM guards (util/libsync.h include + the fd-based sync-file
+# fallback paths, both fd/dma-buf-only and unreachable from the ntagx
+# provider) so it compiles clean without libdrm.
+with_drm_syncobj = dep_libdrm.found() or with_asahi_vk
+if with_drm_syncobj
   vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
-  vulkan_lite_runtime_deps += dep_libdrm
+  if dep_libdrm.found()
+    vulkan_lite_runtime_deps += dep_libdrm
+  endif
 endif
 
 if with_platform_android

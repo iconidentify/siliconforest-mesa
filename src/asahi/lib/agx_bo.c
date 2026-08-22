@@ -331,13 +331,17 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
    if (refcnt)
       return;
 
-   pthread_mutex_lock(&dev->bo_map_lock);
+   simple_mtx_lock(&dev->bo_map_lock);
 
    /* Someone might have imported this BO while we were waiting for the
     * lock, let's make sure it's still not referenced before freeing it.
     */
    if (p_atomic_read(&bo->refcnt) == 0) {
       assert(!p_atomic_read_relaxed(&bo->writer));
+
+      if (bo->_map != NULL ||
+          (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0)
+         p_atomic_inc(&dev->read_set_generation);
 
       if (dev->debug & AGX_DBG_TRACE)
          agxdecode_track_free(dev->agxdecode, bo);
@@ -348,8 +352,24 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
 
    agx_bo_dump_all_periodic(dev);
 
-   pthread_mutex_unlock(&dev->bo_map_lock);
+   simple_mtx_unlock(&dev->bo_map_lock);
 }
+
+/* NTAGX_BO_LOG=1 prints the identity of every BO.  Read straight from the
+ * environment rather than via dev->debug, so "the flag was not read" can never
+ * be mistaken for "the thing did not happen".  Cached; agx_bo_create is hot. */
+#if AGX_GPU_DIAG >= 2
+bool
+ntagx_bo_log_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *v = getenv("NTAGX_BO_LOG");
+      cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+   }
+   return cached == 1;
+}
+#endif
 
 struct agx_bo *
 agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
@@ -389,8 +409,33 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
       return NULL;
    }
 
+   /* vm_id is logged because two agx_device opens (physical device and logical
+    * device) each allocate their own zero/scratch/printf BOs from their own
+    * VMA heap, so identical GPU VAs across handles are EXPECTED when the vm_id
+    * differs -- and an aliasing bug when it does not.
+    *
+    * map= is the BO's _map at CREATION, and must be NULL for a fresh BO. A
+    * non-NULL value means this BO came back from agx_bo_cache_fetch() still
+    * carrying a previous mapping, in which case agx_bo_map_placed() returns
+    * that stale pointer WITHOUT ever calling bo_mmap -- which would produce
+    * four identical CPU addresses with the kernel entirely innocent. That is
+    * the one userspace explanation for the observed aliasing, and this field
+    * separates it from the kernel one in a single line. */
+   if (ntagx_bo_log_enabled()) {
+      fprintf(stderr,
+              "NTAGX_BO: handle=%u uapi=%u vm=%u size=%zu align=%zu flags=0x%x "
+              "gpu_va=0x%" PRIx64 " map=%p label=%s\n",
+              (unsigned)bo->handle, (unsigned)bo->uapi_handle,
+              (unsigned)dev->vm_id, (size_t)bo->size, (size_t)bo->align,
+              (unsigned)flags, bo->va ? (uint64_t)bo->va->addr : 0ull,
+              bo->_map, label ? label : "(none)");
+   }
+
    bo->label = label;
    p_atomic_set(&bo->refcnt, 1);
+   if (bo->_map != NULL ||
+       (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0)
+      p_atomic_inc(&dev->read_set_generation);
 
    if (dev->debug & AGX_DBG_TRACE) {
       agx_bo_map(bo);
