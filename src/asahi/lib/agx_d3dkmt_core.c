@@ -1063,7 +1063,13 @@ agx_d3dkmt_agxw_alloc_flags(uint32_t agx_bo_flags)
 uint32_t
 agx_d3dkmt_cpu_visible_flags(uint32_t agx_bo_flags)
 {
-   if (agx_bo_flags & AGX_D3DKMT_BO_EXEC)
+   /* Private executable pools are CPU-write-only and use the ordinary WC
+    * upload path. Keep externally visible executable storage conservative:
+    * another process may retain a writable mapping outside this winsys's
+    * producer tracking. */
+   if ((agx_bo_flags & AGX_D3DKMT_BO_EXEC) &&
+       (agx_bo_flags &
+        (AGX_D3DKMT_BO_SHARED | AGX_D3DKMT_BO_SHAREABLE)))
       agx_bo_flags |= AGX_D3DKMT_BO_WRITEBACK;
 
    return agx_bo_flags;

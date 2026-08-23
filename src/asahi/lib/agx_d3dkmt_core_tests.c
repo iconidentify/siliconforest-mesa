@@ -169,10 +169,17 @@ test_cpu_visible_executable_flags(void)
    CHECK_EQ(agx_d3dkmt_cpu_visible_flags(AGX_D3DKMT_BO_WRITEBACK),
             AGX_D3DKMT_BO_WRITEBACK);
    CHECK_EQ(agx_d3dkmt_cpu_visible_flags(AGX_D3DKMT_BO_EXEC),
-            AGX_D3DKMT_BO_EXEC | AGX_D3DKMT_BO_WRITEBACK);
+            AGX_D3DKMT_BO_EXEC);
    CHECK_EQ(agx_d3dkmt_cpu_visible_flags(AGX_D3DKMT_BO_EXEC |
                                          AGX_D3DKMT_BO_LOW_VA),
-            AGX_D3DKMT_BO_EXEC | AGX_D3DKMT_BO_LOW_VA |
+            AGX_D3DKMT_BO_EXEC | AGX_D3DKMT_BO_LOW_VA);
+   CHECK_EQ(agx_d3dkmt_cpu_visible_flags(AGX_D3DKMT_BO_EXEC |
+                                         AGX_D3DKMT_BO_SHARED),
+            AGX_D3DKMT_BO_EXEC | AGX_D3DKMT_BO_SHARED |
+               AGX_D3DKMT_BO_WRITEBACK);
+   CHECK_EQ(agx_d3dkmt_cpu_visible_flags(AGX_D3DKMT_BO_EXEC |
+                                         AGX_D3DKMT_BO_SHAREABLE),
+            AGX_D3DKMT_BO_EXEC | AGX_D3DKMT_BO_SHAREABLE |
                AGX_D3DKMT_BO_WRITEBACK);
 }
 
@@ -994,6 +1001,7 @@ test_alloc_flags(void)
    uint32_t exec = agx_d3dkmt_agxw_alloc_flags(AGX_D3DKMT_BO_EXEC |
                                                AGX_D3DKMT_BO_LOW_VA);
    CHECK_EQ(exec & ~(uint32_t)(AGXW_ALLOC_VM_PRIVATE), 0);
+   CHECK(!(exec & AGXW_ALLOC_WRITEBACK));
 
    CHECK(agx_d3dkmt_agxw_alloc_flags(AGX_D3DKMT_BO_WRITEBACK) &
          AGXW_ALLOC_WRITEBACK);

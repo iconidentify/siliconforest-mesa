@@ -2162,7 +2162,11 @@ staging_for(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t size)
    if (bo == NULL) {
       size_t alloc = ALIGN_POT(MAX2((size_t)size, (size_t)AIL_PAGESIZE),
                                AIL_PAGESIZE);
-      bo = agx_bo_create(dev, alloc, 0, AGX_BO_WRITEBACK, "D3DKMT cmdbuf");
+      /* The CPU writes this ring slot once, then the KMD consumes it. Keep it
+       * write-combined like Asahi's ordinary upload storage. The miniport's
+       * submit-scoped WC publication orders every producer CPU before AGX is
+       * kicked, so this page has no write-back cache lines to clean. */
+      bo = agx_bo_create(dev, alloc, 0, 0, "D3DKMT cmdbuf");
       if (bo == NULL)
          return NULL;
       ctx->staging[slot] = bo;
