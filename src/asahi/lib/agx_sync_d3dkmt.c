@@ -670,6 +670,9 @@ util_sync_provider_d3dkmt(struct agx_device *dev)
 
    d->dev = dev;
    d->base = (struct util_sync_provider){
+      /* WDDM monitored-fence waits are queued on the context and may name a
+       * value whose signal has not been submitted yet. */
+      .features = UTIL_SYNC_PROVIDER_WAIT_BEFORE_SIGNAL,
       .create = d3dkmt_syncobj_create,
       .destroy = d3dkmt_syncobj_destroy,
       .handle_to_fd = d3dkmt_syncobj_handle_to_fd,

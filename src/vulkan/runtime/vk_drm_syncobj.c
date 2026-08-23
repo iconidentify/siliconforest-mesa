@@ -728,12 +728,7 @@ vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync)
 
    struct vk_sync_type type = {
       .size = sizeof(struct vk_drm_syncobj),
-      .features = VK_SYNC_FEATURE_BINARY |
-                  VK_SYNC_FEATURE_GPU_WAIT |
-                  VK_SYNC_FEATURE_GPU_MULTI_WAIT |
-                  VK_SYNC_FEATURE_CPU_RESET |
-                  VK_SYNC_FEATURE_CPU_SIGNAL |
-                  VK_SYNC_FEATURE_WAIT_PENDING,
+      .features = vk_drm_syncobj_provider_features(sync),
       .init = vk_drm_syncobj_init,
       .finish = vk_drm_syncobj_finish,
       .signal = vk_drm_syncobj_signal,
@@ -758,7 +753,6 @@ vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync)
 
    if (sync->timeline_wait) {
       type.get_value = vk_drm_syncobj_get_value;
-      type.features |= VK_SYNC_FEATURE_TIMELINE;
    }
 
    err = sync->destroy(sync, syncobj);

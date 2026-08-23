@@ -12,7 +12,14 @@
 extern "C" {
 #endif
 
+enum util_sync_provider_features {
+   /** The kernel accepts a GPU wait before its matching signal is queued. */
+   UTIL_SYNC_PROVIDER_WAIT_BEFORE_SIGNAL = (1 << 0),
+};
+
 struct util_sync_provider {
+   enum util_sync_provider_features features;
+
    int (*create)(struct util_sync_provider *p, uint32_t flags, uint32_t *handle);
    int (*destroy)(struct util_sync_provider *p, uint32_t handle);
    int (*handle_to_fd)(struct util_sync_provider *p, uint32_t handle, int *out_obj_fd);
