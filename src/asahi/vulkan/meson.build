@@ -28,6 +28,7 @@ hk_files = files(
   'hk_format.c',
   'hk_image.c',
   'hk_image.h',
+  'hk_host_image_copy.h',
   'hk_image_view.c',
   'hk_image_view.h',
   'hk_instance.c',
@@ -187,3 +188,15 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+
+if with_tests
+  test(
+    'hk_host_image_copy',
+    executable(
+      'hk_host_image_copy_test',
+      files('tests/hk_host_image_copy_test.c'),
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+endif

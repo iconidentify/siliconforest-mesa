@@ -54,9 +54,10 @@ struct hk_image_plane {
    uint64_t addr;
    struct agx_va *va;
 
-   /* For host image copy */
-   void *map;
-   uint32_t rem;
+   /* Bound allocation metadata for host image copies. The BO is mapped only
+    * when a host-copy command actually accesses this plane. */
+   struct agx_bo *bo;
+   uint64_t bo_offset_B;
 
    /* If the image has sparse residency, its residency is tracked in this
     * secondary page table. Otherwise, this map is NULL.
