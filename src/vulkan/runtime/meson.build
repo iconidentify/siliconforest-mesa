@@ -349,3 +349,16 @@ idep_vulkan_runtime = declare_dependency(
     idep_vulkan_runtime_body,
   ]
 )
+
+if with_tests
+  test(
+    'vk_drm_syncobj_provider_tests',
+    executable(
+      'vk_drm_syncobj_provider_tests',
+      files('tests/vk_drm_syncobj_provider_tests.c'),
+      include_directories : [inc_include, inc_src],
+      dependencies : [vulkan_wsi_deps],
+    ),
+    suite : ['vulkan-runtime'],
+  )
+endif

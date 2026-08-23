@@ -26,6 +26,7 @@
 #include "vk_sync.h"
 
 #include "util/macros.h"
+#include "util/u_sync_provider.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,6 +36,26 @@ struct vk_drm_syncobj {
    struct vk_sync base;
    uint32_t syncobj;
 };
+
+static inline enum vk_sync_features
+vk_drm_syncobj_provider_features(const struct util_sync_provider *provider)
+{
+   enum vk_sync_features features =
+      VK_SYNC_FEATURE_BINARY |
+      VK_SYNC_FEATURE_GPU_WAIT |
+      VK_SYNC_FEATURE_GPU_MULTI_WAIT |
+      VK_SYNC_FEATURE_CPU_RESET |
+      VK_SYNC_FEATURE_CPU_SIGNAL |
+      VK_SYNC_FEATURE_WAIT_PENDING;
+
+   if (provider->timeline_wait)
+      features |= VK_SYNC_FEATURE_TIMELINE;
+
+   if (provider->features & UTIL_SYNC_PROVIDER_WAIT_BEFORE_SIGNAL)
+      features |= VK_SYNC_FEATURE_WAIT_BEFORE_SIGNAL;
+
+   return features;
+}
 
 void vk_drm_syncobj_finish(struct vk_device *device,
                            struct vk_sync *sync);
@@ -68,7 +89,6 @@ VkResult vk_drm_syncobj_copy_payloads(struct vk_device *device,
                                       uint32_t signal_count,
                                       const struct vk_sync_signal *signals);
 
-struct util_sync_provider;
 struct vk_sync_type vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync);
 struct vk_sync_type vk_drm_syncobj_get_type(int drm_fd);
 
