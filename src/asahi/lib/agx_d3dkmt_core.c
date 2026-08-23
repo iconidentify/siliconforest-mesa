@@ -165,6 +165,55 @@ dirty_make_whole(struct agx_d3dkmt_dirty_state *state)
    state->range_count = 0;
 }
 
+static void
+dirty_record_compaction(struct agx_d3dkmt_dirty_state *state,
+                        uint64_t bridged_bytes)
+{
+   if (state->range_compaction_count != UINT64_MAX)
+      state->range_compaction_count++;
+
+   if (bridged_bytes > UINT64_MAX - state->range_compaction_bridged_bytes)
+      state->range_compaction_bridged_bytes = UINT64_MAX;
+   else
+      state->range_compaction_bridged_bytes += bridged_bytes;
+}
+
+static void
+dirty_insert_full_disjoint(struct agx_d3dkmt_dirty_state *state,
+                           uint32_t insertion, uint64_t start, uint64_t end)
+{
+   struct agx_d3dkmt_dirty_range
+      ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO + 1];
+
+   memcpy(ranges, state->ranges,
+          (size_t)insertion * sizeof(ranges[0]));
+   ranges[insertion] =
+      (struct agx_d3dkmt_dirty_range){start, end - start};
+   memcpy(&ranges[insertion + 1], &state->ranges[insertion],
+          (size_t)(state->range_count - insertion) * sizeof(ranges[0]));
+
+   uint32_t smallest = 0;
+   uint64_t smallest_gap = UINT64_MAX;
+   for (uint32_t i = 0; i < AGX_D3DKMT_DIRTY_RANGES_PER_BO; i++) {
+      const uint64_t left_end = ranges[i].offset + ranges[i].length;
+      const uint64_t gap = ranges[i + 1].offset - left_end;
+      if (gap < smallest_gap) {
+         smallest = i;
+         smallest_gap = gap;
+      }
+   }
+
+   ranges[smallest].length =
+      ranges[smallest + 1].offset + ranges[smallest + 1].length -
+      ranges[smallest].offset;
+   memmove(&ranges[smallest + 1], &ranges[smallest + 2],
+           (size_t)(AGX_D3DKMT_DIRTY_RANGES_PER_BO - smallest - 1) *
+              sizeof(ranges[0]));
+   memcpy(state->ranges, ranges,
+          AGX_D3DKMT_DIRTY_RANGES_PER_BO * sizeof(ranges[0]));
+   dirty_record_compaction(state, smallest_gap);
+}
+
 static bool
 dirty_insert_aligned(struct agx_d3dkmt_dirty_state *state, uint64_t start,
                      uint64_t end)
@@ -183,7 +232,7 @@ dirty_insert_aligned(struct agx_d3dkmt_dirty_state *state, uint64_t start,
 
    if (first == state->range_count || end < state->ranges[first].offset) {
       if (state->range_count == AGX_D3DKMT_DIRTY_RANGES_PER_BO) {
-         dirty_make_whole(state);
+         dirty_insert_full_disjoint(state, first, start, end);
          return true;
       }
 

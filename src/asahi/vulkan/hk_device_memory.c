@@ -15,8 +15,56 @@
 #include "util/u_atomic.h"
 
 #ifdef _WIN32
+#include <stddef.h>
 #include <windows.h>
 #include "asahi/lib/agx_device_d3dkmt.h"
+
+#define VK_STRUCTURE_TYPE_AURORA_CPU_PRODUCER_ALLOCATE_INFO \
+   ((VkStructureType)0x7ff8415au)
+#define AURORA_CPU_PRODUCER_ALLOCATE_INFO_VERSION 1u
+
+struct aurora_cpu_producer_allocate_info {
+   VkStructureType sType;
+   const void *pNext;
+   uint32_t version;
+   uint32_t flags;
+};
+
+_Static_assert(sizeof(struct aurora_cpu_producer_allocate_info) == 24,
+               "Aurora producer ABI size");
+_Static_assert(offsetof(struct aurora_cpu_producer_allocate_info, pNext) == 8,
+               "Aurora producer ABI pNext offset");
+_Static_assert(offsetof(struct aurora_cpu_producer_allocate_info, version) == 16,
+               "Aurora producer ABI version offset");
+_Static_assert(offsetof(struct aurora_cpu_producer_allocate_info, flags) == 20,
+               "Aurora producer ABI flags offset");
+
+static bool
+hk_aurora_cpu_producer_requested(const void *next,
+                                 bool *runtime_resource)
+{
+   bool requested = false;
+   uint32_t producer_info_count = 0;
+   *runtime_resource = false;
+
+   for (const VkBaseInStructure *bs = (const VkBaseInStructure *)next;
+        bs != NULL; bs = bs->pNext) {
+      if ((unsigned)bs->sType == 0x7ff84159u)
+         *runtime_resource = true;
+
+      if (bs->sType ==
+          VK_STRUCTURE_TYPE_AURORA_CPU_PRODUCER_ALLOCATE_INFO) {
+         producer_info_count++;
+         const struct aurora_cpu_producer_allocate_info *info =
+            (const struct aurora_cpu_producer_allocate_info *)bs;
+         requested =
+            info->version == AURORA_CPU_PRODUCER_ALLOCATE_INFO_VERSION &&
+            info->flags == 0;
+      }
+   }
+
+   return producer_info_count == 1 && requested;
+}
 
 /* Runtime-device bridge hooks (__has_include keeps AGXKMD/Linux
  * byte-identical). Provides agx_bridge_vma_registered() -- the per-device
@@ -294,22 +342,12 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    const VkImportMemoryWin32HandleInfoKHR *win32_info =
       vk_find_struct_const(pAllocateInfo->pNext,
                            IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+   bool aurora_runtime_resource = false;
+   const bool aurora_cpu_producer_requested =
+      hk_aurora_cpu_producer_requested(pAllocateInfo->pNext,
+                                       &aurora_runtime_resource);
 #endif
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
-
-#ifdef HK_HAVE_BRIDGE_HOOKS
-   /* VK_STRUCTURE_TYPE_AURORA_RUNTIME_RESOURCE_ALLOCATE_INFO. Private sType,
-    * matched by value to avoid a header dependency on the DXVK-side struct. */
-   bool aurora_runtime_resource = false;
-   for (const VkBaseInStructure *bs =
-           (const VkBaseInStructure *)pAllocateInfo->pNext;
-        bs != NULL; bs = bs->pNext) {
-      if ((unsigned)bs->sType == 0x7ff84159u) {
-         aurora_runtime_resource = true;
-         break;
-      }
-   }
-#endif
 
    VkExternalMemoryHandleTypeFlags handle_types = 0;
    if (export_info != NULL)
@@ -388,6 +426,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    mem->map = NULL;
+   mem->aurora_cpu_producer = false;
 #ifdef _WIN32
    if (win32_info != NULL) {
       if (local_allocation) {
@@ -529,6 +568,16 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
    }
 
+#ifdef _WIN32
+   /* Fail closed to RAW for every allocation that can cross a process or
+    * API ownership boundary. The marker is advisory until the resulting BO
+    * is proven private as well. */
+   mem->aurora_cpu_producer =
+      aurora_cpu_producer_requested && !aurora_runtime_resource &&
+      handle_types == 0 && fd_info == NULL && win32_info == NULL &&
+      (mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0;
+#endif
+
    /* Shadow map in case this is used for a sparse resident buffer */
    int ret = agx_bo_bind(&dev->dev, mem->bo,
                          agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
@@ -661,7 +710,14 @@ hk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
                        "Memory object already mapped.");
    }
 
-   mem->map = agx_bo_map_placed(mem->bo, fixed_addr);
+   if (mem->aurora_cpu_producer && fixed_addr == NULL) {
+      mem->map = agx_bo_map_tracked(mem->bo);
+   } else {
+      /* One raw pointer permanently ends cooperative ownership for this
+       * allocation lifetime. A later remap must not recover TRACKED state. */
+      mem->aurora_cpu_producer = false;
+      mem->map = agx_bo_map_placed(mem->bo, fixed_addr);
+   }
    if (mem->map == NULL) {
       *ppData = NULL;
       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,

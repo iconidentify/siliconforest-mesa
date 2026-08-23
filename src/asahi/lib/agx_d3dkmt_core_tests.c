@@ -1176,7 +1176,7 @@ test_read_range_compaction(void)
 }
 
 static void
-test_dirty_interval_merge_and_overflow(void)
+test_dirty_interval_merge_and_compaction(void)
 {
    const uint64_t bo_size = 0x50000;
    struct agx_d3dkmt_dirty_state state;
@@ -1200,8 +1200,16 @@ test_dirty_interval_merge_and_overflow(void)
    CHECK_EQ(state.range_count, AGX_D3DKMT_DIRTY_RANGES_PER_BO);
    CHECK_EQ(agx_d3dkmt_dirty_mark(&state, bo_size, 0x44000, 1),
             AGX_D3DKMT_DIRTY_OK);
-   CHECK(state.whole_bo);
-   CHECK_EQ(state.range_count, 0);
+   CHECK(!state.whole_bo);
+   CHECK_EQ(state.range_count, AGX_D3DKMT_DIRTY_RANGES_PER_BO);
+   CHECK_EQ(state.ranges[0].offset, 0);
+   CHECK_EQ(state.ranges[0].length, 0xc000);
+   CHECK_EQ(state.ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO - 1].offset,
+            0x44000);
+   CHECK_EQ(state.ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO - 1].length,
+            0x4000);
+   CHECK_EQ(state.range_compaction_count, 1);
+   CHECK_EQ(state.range_compaction_bridged_bytes, 0x4000);
 }
 
 static void
@@ -1233,6 +1241,38 @@ test_dirty_detach_restore_and_stale_identity(void)
    CHECK_EQ(agx_d3dkmt_dirty_commit(&state, &snapshot),
             AGX_D3DKMT_DIRTY_STALE);
    CHECK(!agx_d3dkmt_dirty_has_pending(&state));
+}
+
+static void
+test_dirty_restore_compacts_without_losing_newer_write(void)
+{
+   const uint64_t bo_size = 0x100000;
+   struct agx_d3dkmt_dirty_state state;
+   struct agx_d3dkmt_dirty_snapshot snapshot;
+   agx_d3dkmt_dirty_reset(&state, 117);
+
+   for (uint32_t i = 0; i < AGX_D3DKMT_DIRTY_RANGES_PER_BO; i++) {
+      CHECK_EQ(agx_d3dkmt_dirty_mark(
+                  &state, bo_size, (uint64_t)i * 0x10000, 1),
+               AGX_D3DKMT_DIRTY_OK);
+   }
+   CHECK(agx_d3dkmt_dirty_detach(&state, &snapshot));
+
+   /* A writer racing a failed submit publishes a ninth disjoint interval.
+    * Restoring the older snapshot bridges only the smallest gap and retains
+    * the newer interval at 0x88000. */
+   CHECK_EQ(agx_d3dkmt_dirty_mark(&state, bo_size, 0x88000, 1),
+            AGX_D3DKMT_DIRTY_OK);
+   const uint64_t newer_epoch = state.cpu_write_epoch;
+   CHECK_EQ(agx_d3dkmt_dirty_restore(&state, bo_size, &snapshot),
+            AGX_D3DKMT_DIRTY_OK);
+   CHECK(!state.whole_bo);
+   CHECK_EQ(state.range_count, AGX_D3DKMT_DIRTY_RANGES_PER_BO);
+   CHECK_EQ(state.range_compaction_count, 1);
+   CHECK_EQ(state.range_compaction_bridged_bytes, 0xc000);
+   CHECK_EQ(state.ranges[AGX_D3DKMT_DIRTY_RANGES_PER_BO - 1].offset,
+            0x88000);
+   CHECK_EQ(state.cpu_write_epoch, newer_epoch);
 }
 
 static void
@@ -1533,8 +1573,9 @@ main(void)
    test_alloc_flags();
    test_read_range_canonicalization();
    test_read_range_compaction();
-   test_dirty_interval_merge_and_overflow();
+   test_dirty_interval_merge_and_compaction();
    test_dirty_detach_restore_and_stale_identity();
+   test_dirty_restore_compacts_without_losing_newer_write();
    test_dirty_repeated_unchanged_submit();
    test_dirty_cached_mapping_reuse();
    test_tracked_map_first_snapshot_accept_restore_and_exact_writes();

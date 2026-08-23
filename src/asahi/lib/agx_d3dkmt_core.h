@@ -517,8 +517,9 @@ int agx_d3dkmt_read_ranges_compact(struct agxw_submit_read_range *ranges,
                                    uint64_t *bridged_bytes);
 
 /* A BO normally has only one or two independently updated CPU regions. Keep
- * those intervals exact and bounded. If a pathological writer produces more,
- * the state falls back to the current BO lifetime's whole range. */
+ * those intervals exact and bounded. When the vector fills, bridge the
+ * smallest adjacent gap so every byte remains covered without collapsing to
+ * the whole BO. */
 #define AGX_D3DKMT_DIRTY_RANGES_PER_BO 8u
 
 struct agx_d3dkmt_dirty_range {
@@ -530,6 +531,8 @@ struct agx_d3dkmt_dirty_state {
    uint64_t identity;
    uint64_t cpu_write_epoch;
    uint64_t clean_epoch;
+   uint64_t range_compaction_count;
+   uint64_t range_compaction_bridged_bytes;
    uint32_t range_count;
    bool whole_bo;
    struct agx_d3dkmt_dirty_range

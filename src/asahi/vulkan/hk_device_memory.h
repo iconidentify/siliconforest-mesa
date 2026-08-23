@@ -22,6 +22,10 @@ struct hk_device_memory {
    struct agx_bo *bo;
 
    void *map;
+
+   /* The allocation carries Aurora's versioned private producer contract.
+    * Only the cooperating runtime receives a tracked CPU mapping. */
+   bool aurora_cpu_producer;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,
