@@ -2393,6 +2393,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    priv->base.out_sync_count = 0;
    priv->base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
       AGXW_SUBMIT_CLEAN_SET_COMPLETE |
+      AGXW_SUBMIT_HOST_WRITES_RELEASED |
       ((submit->flags & AGX_SUBMIT_WRITE_SET_COMPLETE)
           ? AGXW_SUBMIT_WRITE_SET_COMPLETE : 0);
    priv_size = (uint32_t)sizeof(*priv) +
@@ -2434,6 +2435,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       .BroadcastContext = {ctx->hContext},
    };
 
+   /* Publish every host write ordered before this queue submission so the KMD
+    * can use its local WC publication path. */
+   MemoryBarrier();
    agx_kmt_status st = ws->fns.SubmitCommand(&cmd);
    if (!AGX_KMT_SUCCESS(st)) {
       ret = agx_d3dkmt_fail(st);
