@@ -1551,14 +1551,18 @@ hk_create_win_physical_device(struct vk_instance *_instance,
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
       .heapIndex = sysmem_heap_idx,
    };
 
+   /* DXVK selects the lowest eligible memory-type index.  Put write-combined
+    * memory first on Windows so ordinary DEVICE_LOCAL allocations do not opt
+    * into Aurora's write-back submit cleaning.  Callers that require
+    * HOST_CACHED still select the type below. */
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
       .heapIndex = sysmem_heap_idx,
    };
