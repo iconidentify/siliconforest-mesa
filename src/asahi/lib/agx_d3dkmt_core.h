@@ -489,9 +489,9 @@ int agx_d3dkmt_parse_identity(const void *blob, uint32_t blob_size,
  */
 uint32_t agx_d3dkmt_agxw_alloc_flags(uint32_t agx_bo_flags);
 
-/* CPU-authored executable storage is persistent-mapped on Windows.  Give it
- * a cacheable mapping so D3DKMTInvalidateCache can establish the required
- * CPU-write -> GPU-read ownership transition. */
+/* Private CPU-write-only executable storage remains WC, matching Asahi's
+ * ordinary BO policy. Externally visible executable storage stays WB because
+ * its producer lifetime is not contained by this winsys. */
 uint32_t agx_d3dkmt_cpu_visible_flags(uint32_t agx_bo_flags);
 
 /* enum agx_bo_flags -> D3DKMT_CREATEALLOCATIONFLAGS. */
