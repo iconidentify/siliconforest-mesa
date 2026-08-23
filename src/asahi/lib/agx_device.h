@@ -261,6 +261,13 @@ struct agx_device {
     * set while the first context temporarily owned the only dirty snapshot. */
    simple_mtx_t d3dkmt_submit_clean_lock;
    uint64_t d3dkmt_next_bo_identity;
+   /* Two dense-handle bitsets, protected by d3dkmt_dirty_lock. The first is
+    * the exact set of BOs with pending CPU ownership; the second is the much
+    * smaller set of raw/imported/exported mappings which must be republished
+    * every submit. This removes the O(max_handle) clean-set walk from the
+    * steady-state submit path without weakening failed-submit restoration. */
+   uint64_t *d3dkmt_worksets;
+   uint32_t d3dkmt_workset_words;
 #endif
 
    struct {

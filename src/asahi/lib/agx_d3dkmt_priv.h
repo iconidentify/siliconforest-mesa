@@ -143,6 +143,9 @@ struct agx_d3dkmt_winsys {
    uint64_t dirty_conservative_bytes;
    uint64_t dirty_clean_vector_fallbacks;
    uint64_t dirty_stale_snapshots;
+   uint64_t dirty_worklist_candidates;
+   uint64_t dirty_conservative_candidates;
+   uint64_t dirty_worklist_full_scans;
    uint64_t read_set_compactions;
    uint64_t read_set_compacted_gap_bytes;
 

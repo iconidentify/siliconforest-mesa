@@ -35,6 +35,7 @@
 #include <winternl.h>
 
 #include "util/macros.h"
+#include "util/bitscan.h"
 #include "util/u_math.h"
 #include "util/u_atomic.h"
 #include "agx_bo.h"
@@ -384,6 +385,111 @@ ctx_get(struct agx_d3dkmt_winsys *ws, uint32_t queue_id)
 }
 
 /* -------------------------------------------------------------------------
+ * CPU-ownership worksets.
+ *
+ * Dense BO handles make a bitset the natural queue: setting a dirty bit is
+ * O(1), duplicate-free and allocation-free at every CPU-write choke point.
+ * Capacity grows before a newly adopted BO becomes visible. The second half
+ * of the allocation is persistent conservative membership; ORing it into the
+ * pending half once per submit replaces a BO-table walk with one word per 64
+ * possible handles.
+ * ------------------------------------------------------------------------- */
+static bool
+d3dkmt_worksets_reserve_locked(struct agx_device *dev, uint32_t handles)
+{
+   uint32_t needed = handles / 64u + ((handles % 64u) != 0u);
+   uint32_t words = dev->d3dkmt_workset_words;
+   uint64_t *replacement;
+
+   if (needed <= words)
+      return true;
+   if (words == 0)
+      words = 16u;
+   while (words < needed) {
+      if (words > UINT32_MAX / 2u)
+         return false;
+      words *= 2u;
+   }
+   if ((size_t)words > SIZE_MAX / (2u * sizeof(uint64_t)))
+      return false;
+
+   replacement = calloc((size_t)words * 2u, sizeof(uint64_t));
+   if (replacement == NULL)
+      return false;
+   if (dev->d3dkmt_worksets != NULL) {
+      memcpy(replacement, dev->d3dkmt_worksets,
+             (size_t)dev->d3dkmt_workset_words * sizeof(uint64_t));
+      memcpy(replacement + words,
+             dev->d3dkmt_worksets + dev->d3dkmt_workset_words,
+             (size_t)dev->d3dkmt_workset_words * sizeof(uint64_t));
+      free(dev->d3dkmt_worksets);
+   }
+   dev->d3dkmt_worksets = replacement;
+   dev->d3dkmt_workset_words = words;
+   return true;
+}
+
+static inline uint64_t *
+d3dkmt_dirty_workset(struct agx_device *dev)
+{
+   return dev->d3dkmt_worksets;
+}
+
+static inline uint64_t *
+d3dkmt_conservative_workset(struct agx_device *dev)
+{
+   return dev->d3dkmt_worksets == NULL
+             ? NULL
+             : dev->d3dkmt_worksets + dev->d3dkmt_workset_words;
+}
+
+static inline bool
+d3dkmt_workset_write(uint64_t *workset, uint32_t words, uint32_t handle,
+                     bool value)
+{
+   uint32_t word = handle / 64u;
+   uint64_t bit = UINT64_C(1) << (handle % 64u);
+
+   if (workset == NULL || word >= words)
+      return false;
+   if (value)
+      workset[word] |= bit;
+   else
+      workset[word] &= ~bit;
+   return true;
+}
+
+static inline bool
+d3dkmt_bo_requires_conservative_clean(const struct agx_bo *bo)
+{
+   return bo->d3dkmt_cpu_map.conservative ||
+          bo->d3dkmt_origin == AGX_D3DKMT_BO_IMPORTED_EXTERNAL ||
+          bo->d3dkmt_origin == AGX_D3DKMT_BO_EXPORTED;
+}
+
+static void
+d3dkmt_bo_publish_work_locked(struct agx_device *dev, struct agx_bo *bo)
+{
+   const bool dirty = agx_d3dkmt_dirty_has_pending(&bo->d3dkmt_dirty);
+   const bool conservative = d3dkmt_bo_requires_conservative_clean(bo);
+
+   (void)d3dkmt_workset_write(d3dkmt_dirty_workset(dev),
+                              dev->d3dkmt_workset_words, bo->handle, dirty);
+   (void)d3dkmt_workset_write(d3dkmt_conservative_workset(dev),
+                              dev->d3dkmt_workset_words, bo->handle,
+                              conservative);
+}
+
+static void
+d3dkmt_bo_remove_work_locked(struct agx_device *dev, struct agx_bo *bo)
+{
+   (void)d3dkmt_workset_write(d3dkmt_dirty_workset(dev),
+                              dev->d3dkmt_workset_words, bo->handle, false);
+   (void)d3dkmt_workset_write(d3dkmt_conservative_workset(dev),
+                              dev->d3dkmt_workset_words, bo->handle, false);
+}
+
+/* -------------------------------------------------------------------------
  * GEM_CREATE / GEM_CLOSE.
  * ------------------------------------------------------------------------- */
 static void
@@ -559,13 +665,39 @@ d3dkmt_adopt_allocation(
       d3dkmt_destroy_record(ws, record);
       return NULL;
    }
+   if (handle == UINT32_MAX) {
+      simple_mtx_lock(&ws->lock);
+      struct agx_d3dkmt_allocation_record released;
+      bool found =
+         agx_d3dkmt_pool_release_record(&ws->pool, handle, &released);
+      simple_mtx_unlock(&ws->lock);
+      if (found)
+         d3dkmt_destroy_record(ws, &released);
+      errno = ENOSPC;
+      return NULL;
+   }
 
    simple_mtx_lock(&dev->bo_map_lock);
+   simple_mtx_lock(&dev->d3dkmt_dirty_lock);
+   if (!d3dkmt_worksets_reserve_locked(dev, handle + 1u)) {
+      simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
+      simple_mtx_unlock(&dev->bo_map_lock);
+      simple_mtx_lock(&ws->lock);
+      struct agx_d3dkmt_allocation_record released;
+      bool found =
+         agx_d3dkmt_pool_release_record(&ws->pool, handle, &released);
+      simple_mtx_unlock(&ws->lock);
+      if (found)
+         d3dkmt_destroy_record(ws, &released);
+      errno = ENOMEM;
+      return NULL;
+   }
    bo = agx_lookup_bo(dev, handle);
    /* max_handle is consumed as an exclusive bound throughout agx_bo.c and
     * submit read-set construction. Dense D3DKMT handle 1 must therefore make
     * the bound 2, not 1. */
    dev->max_handle = MAX2(dev->max_handle, handle + 1);
+   simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
    simple_mtx_unlock(&dev->bo_map_lock);
 
    /* util_sparse_array_get grows its node tree on demand and returns NULL on
@@ -920,6 +1052,7 @@ agx_d3dkmt_bo_create_external(
       agx_bo_reset_cpu_dirty(bo);
       simple_mtx_lock(&dev->d3dkmt_dirty_lock);
       bo->d3dkmt_origin = AGX_D3DKMT_BO_CREATED_SHAREABLE;
+      d3dkmt_bo_publish_work_locked(dev, bo);
       simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
       p_atomic_set(&bo->refcnt, 1);
       p_atomic_inc(&dev->read_set_generation);
@@ -951,6 +1084,8 @@ agx_d3dkmt_bo_import_external(
       agx_bo_reset_cpu_dirty(bo);
       simple_mtx_lock(&dev->d3dkmt_dirty_lock);
       bo->d3dkmt_origin = AGX_D3DKMT_BO_IMPORTED_EXTERNAL;
+      (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+      d3dkmt_bo_publish_work_locked(dev, bo);
       simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
       p_atomic_set(&bo->refcnt, 1);
       p_atomic_inc(&dev->read_set_generation);
@@ -999,6 +1134,7 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
       agx_bo_reset_cpu_dirty(bo);
       simple_mtx_lock(&dev->d3dkmt_dirty_lock);
       bo->d3dkmt_origin = AGX_D3DKMT_BO_IMPORTED_LOCAL;
+      d3dkmt_bo_publish_work_locked(dev, bo);
       simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
       p_atomic_set(&bo->refcnt, 1);
       p_atomic_inc(&dev->read_set_generation);
@@ -1078,6 +1214,7 @@ agx_d3dkmt_bo_export_external(
    (void)agx_d3dkmt_cpu_map_request(
       &bo->d3dkmt_cpu_map, &bo->d3dkmt_dirty, bo->size,
       AGX_D3DKMT_CPU_MAP_RAW, false);
+   d3dkmt_bo_publish_work_locked(dev, bo);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
    return 0;
 }
@@ -1454,6 +1591,7 @@ d3dkmt_bo_munmap(struct agx_device *dev, struct agx_bo *bo)
    if (bo->d3dkmt_cpu_map.conservative)
       (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
    agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, false);
+   d3dkmt_bo_publish_work_locked(dev, bo);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1522,6 +1660,7 @@ d3dkmt_bo_mark_cpu_dirty(struct agx_device *dev, struct agx_bo *bo,
          (void)agx_d3dkmt_dirty_mark(&bo->d3dkmt_dirty, bo->size, offset,
                                      size);
       }
+      d3dkmt_bo_publish_work_locked(dev, bo);
    }
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
@@ -1545,6 +1684,7 @@ d3dkmt_bo_set_cpu_map_class(struct agx_device *dev, struct agx_bo *bo,
       (void)agx_d3dkmt_cpu_map_request(
          &bo->d3dkmt_cpu_map, &bo->d3dkmt_dirty, bo->size, requested,
          tracked_allowed);
+      d3dkmt_bo_publish_work_locked(dev, bo);
    }
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
@@ -1572,6 +1712,7 @@ d3dkmt_bo_reset_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
     * runs before refcnt publication, so re-establish the mapped lifetime's
     * whole-BO ownership atomically with its new identity. */
    agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, bo->_map != NULL);
+   d3dkmt_bo_publish_work_locked(dev, bo);
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
 }
 
@@ -1579,6 +1720,7 @@ static void
 d3dkmt_bo_discard_cpu_dirty(struct agx_device *dev, struct agx_bo *bo)
 {
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
+   d3dkmt_bo_remove_work_locked(dev, bo);
    agx_d3dkmt_dirty_reset(&bo->d3dkmt_dirty,
                           d3dkmt_next_bo_identity(dev));
    agx_d3dkmt_cpu_map_reset(&bo->d3dkmt_cpu_map, false);
@@ -1625,6 +1767,59 @@ d3dkmt_reserve_dirty_snapshots(struct agx_d3dkmt_ctx *ctx, uint32_t capacity)
    return 0;
 }
 
+static void
+d3dkmt_snapshot_dirty_bo_locked(
+   struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t handle,
+   struct agxw_submit_read_range *clean_ranges, uint32_t *clean_count,
+   bool *clean_fallback, uint64_t *precise_bytes,
+   uint64_t *conservative_bytes)
+{
+   struct agx_bo *bo = agx_lookup_bo(dev, handle);
+
+   if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0) {
+      (void)d3dkmt_workset_write(d3dkmt_dirty_workset(dev),
+                                 dev->d3dkmt_workset_words, handle, false);
+      return;
+   }
+   if (d3dkmt_bo_requires_conservative_clean(bo))
+      (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+
+   struct agx_d3dkmt_bo_snapshot *entry =
+      &ctx->dirty_snapshots[ctx->dirty_snapshot_count];
+   if (!agx_d3dkmt_dirty_detach(&bo->d3dkmt_dirty, &entry->dirty)) {
+      d3dkmt_bo_publish_work_locked(dev, bo);
+      return;
+   }
+
+   entry->handle = handle;
+   entry->bo_size = bo->size;
+   ctx->dirty_snapshot_count++;
+
+   if (entry->dirty.whole_bo) {
+      *conservative_bytes += bo->size;
+      if (agx_d3dkmt_read_range_add(
+             clean_ranges, clean_count, AGXW_MAX_READ_RANGES_PER_SUBMIT,
+             bo->va->addr, bo->size) != AGX_D3DKMT_OK)
+         *clean_fallback = true;
+   } else {
+      for (uint32_t i = 0; i < entry->dirty.range_count; i++) {
+         const struct agx_d3dkmt_dirty_range *range =
+            &entry->dirty.ranges[i];
+         *precise_bytes += range->length;
+         if (agx_d3dkmt_read_range_add(
+                clean_ranges, clean_count, AGXW_MAX_READ_RANGES_PER_SUBMIT,
+                bo->va->addr + range->offset,
+                range->length) != AGX_D3DKMT_OK)
+         *clean_fallback = true;
+      }
+   }
+
+   /* Detach is the commit point for this work item. Clear it only after the
+    * snapshot owns the dirty state; failed submit restoration republishes the
+    * bit in d3dkmt_finish_dirty_snapshots(). */
+   d3dkmt_bo_publish_work_locked(dev, bo);
+}
+
 static int
 d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
                          struct agxw_submit_read_range *read_ranges,
@@ -1636,6 +1831,9 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
    uint32_t generation;
    uint64_t compacted_gap_bytes = 0;
    bool read_set_compacted = false;
+   uint64_t worklist_candidates = 0;
+   uint64_t conservative_candidates = 0;
+   bool worklist_full_scan = false;
 
    /* max_handle may grow between this read and taking bo_map_lock. Retry
     * rather than allocating while both BO locks are held. */
@@ -1697,45 +1895,40 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
    ctx->dirty_snapshot_count = 0;
 
    simple_mtx_lock(&dev->d3dkmt_dirty_lock);
-   for (uint32_t handle = 0; handle < dev->max_handle; handle++) {
-      struct agx_bo *bo = agx_lookup_bo(dev, handle);
-      if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0)
-         continue;
+   const uint32_t needed_words =
+      dev->max_handle / 64u + ((dev->max_handle % 64u) != 0u);
+   uint64_t *dirty_workset = d3dkmt_dirty_workset(dev);
+   uint64_t *conservative_workset = d3dkmt_conservative_workset(dev);
+   if (dirty_workset != NULL && conservative_workset != NULL &&
+       needed_words <= dev->d3dkmt_workset_words) {
+      for (uint32_t word = 0; word < needed_words; word++) {
+         uint64_t conservative = conservative_workset[word];
+         uint64_t pending = dirty_workset[word] | conservative;
 
-      const bool conservative = bo->d3dkmt_cpu_map.conservative ||
-         bo->d3dkmt_origin == AGX_D3DKMT_BO_IMPORTED_EXTERNAL ||
-         bo->d3dkmt_origin == AGX_D3DKMT_BO_EXPORTED;
-      if (conservative)
-         (void)agx_d3dkmt_dirty_mark_whole(&bo->d3dkmt_dirty, bo->size);
+         worklist_candidates += util_bitcount64(pending);
+         conservative_candidates += util_bitcount64(conservative);
+         while (pending != 0) {
+            uint32_t bit = u_bit_scan64(&pending);
+            uint32_t handle = word * 64u + bit;
 
-      struct agx_d3dkmt_bo_snapshot *entry =
-         &ctx->dirty_snapshots[ctx->dirty_snapshot_count];
-      if (!agx_d3dkmt_dirty_detach(&bo->d3dkmt_dirty, &entry->dirty))
-         continue;
-
-      entry->handle = handle;
-      entry->bo_size = bo->size;
-      ctx->dirty_snapshot_count++;
-
-      if (entry->dirty.whole_bo) {
-         conservative_bytes += bo->size;
-         if (agx_d3dkmt_read_range_add(
-                clean_ranges, &clean_count,
-                AGXW_MAX_READ_RANGES_PER_SUBMIT, bo->va->addr,
-                bo->size) != AGX_D3DKMT_OK)
-            clean_fallback = true;
-      } else {
-         for (uint32_t i = 0; i < entry->dirty.range_count; i++) {
-            const struct agx_d3dkmt_dirty_range *range =
-               &entry->dirty.ranges[i];
-            precise_bytes += range->length;
-            if (agx_d3dkmt_read_range_add(
-                   clean_ranges, &clean_count,
-                   AGXW_MAX_READ_RANGES_PER_SUBMIT,
-                   bo->va->addr + range->offset,
-                   range->length) != AGX_D3DKMT_OK)
-               clean_fallback = true;
+            if (handle >= dev->max_handle)
+               continue;
+            d3dkmt_snapshot_dirty_bo_locked(
+               dev, ctx, handle, clean_ranges, &clean_count,
+               &clean_fallback, &precise_bytes, &conservative_bytes);
          }
+      }
+   } else {
+      /* Capacity is established before BO publication, so this path is an
+       * invariant fallback for correctness, never the expected hot path. */
+      worklist_full_scan = true;
+      if (dirty_workset != NULL)
+         memset(dirty_workset, 0,
+                (size_t)dev->d3dkmt_workset_words * sizeof(uint64_t));
+      for (uint32_t handle = 0; handle < dev->max_handle; handle++) {
+         d3dkmt_snapshot_dirty_bo_locked(
+            dev, ctx, handle, clean_ranges, &clean_count, &clean_fallback,
+            &precise_bytes, &conservative_bytes);
       }
    }
    simple_mtx_unlock(&dev->d3dkmt_dirty_lock);
@@ -1754,6 +1947,10 @@ d3dkmt_build_submit_sets(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx,
       ws->dirty_unchanged_submits++;
    ws->dirty_precise_bytes += precise_bytes;
    ws->dirty_conservative_bytes += conservative_bytes;
+   ws->dirty_worklist_candidates += worklist_candidates;
+   ws->dirty_conservative_candidates += conservative_candidates;
+   if (worklist_full_scan)
+      ws->dirty_worklist_full_scans++;
    if (clean_fallback)
       ws->dirty_clean_vector_fallbacks++;
    if (read_set_compacted) {
@@ -1786,6 +1983,8 @@ d3dkmt_finish_dirty_snapshots(struct agx_device *dev,
                                                &entry->dirty)
                      : agx_d3dkmt_dirty_restore(&bo->d3dkmt_dirty, bo->size,
                                                 &entry->dirty);
+         if (result == AGX_D3DKMT_DIRTY_OK)
+            d3dkmt_bo_publish_work_locked(dev, bo);
       }
       if (result == AGX_D3DKMT_DIRTY_STALE)
          stale++;
@@ -3248,15 +3447,22 @@ agx_d3dkmt_close_device(struct agx_device *dev)
       fprintf(stderr,
               "NTAGX_DIRTY submits=%llu unchanged=%llu precise_bytes=%llu "
               "conservative_bytes=%llu clean_fallbacks=%llu stale=%llu "
-              "read_compactions=%llu gap_bytes=%llu\n",
+              "work_candidates=%llu conservative_candidates=%llu "
+              "work_full_scans=%llu read_compactions=%llu gap_bytes=%llu\n",
               (unsigned long long)ws->dirty_submit_count,
               (unsigned long long)ws->dirty_unchanged_submits,
               (unsigned long long)ws->dirty_precise_bytes,
               (unsigned long long)ws->dirty_conservative_bytes,
               (unsigned long long)ws->dirty_clean_vector_fallbacks,
               (unsigned long long)ws->dirty_stale_snapshots,
+              (unsigned long long)ws->dirty_worklist_candidates,
+              (unsigned long long)ws->dirty_conservative_candidates,
+              (unsigned long long)ws->dirty_worklist_full_scans,
               (unsigned long long)ws->read_set_compactions,
               (unsigned long long)ws->read_set_compacted_gap_bytes);
+   free(dev->d3dkmt_worksets);
+   dev->d3dkmt_worksets = NULL;
+   dev->d3dkmt_workset_words = 0;
    simple_mtx_destroy(&dev->d3dkmt_submit_clean_lock);
    simple_mtx_destroy(&dev->d3dkmt_dirty_lock);
    simple_mtx_destroy(&ws->lock);
