@@ -20,6 +20,7 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
+#include "hk_host_image_copy.h"
 #include "hk_physical_device.h"
 
 #include "vk_format.h"
@@ -1486,8 +1487,8 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       UNREACHABLE("todo");
    } else {
       plane->addr = mem->bo->va->addr + *offset_B;
-      plane->map = agx_bo_map(mem->bo) + *offset_B;
-      plane->rem = mem->bo->size - (*offset_B);
+      plane->bo = mem->bo;
+      plane->bo_offset_B = *offset_B;
    }
 
    *offset_B += plane->layout.size_B;
@@ -1556,13 +1557,65 @@ hk_plane_index(VkFormat format, VkImageAspectFlags aspect_mask)
    }
 }
 
-static void
+static VkResult
+hk_image_plane_map_for_host_copy(struct hk_device *device,
+                                 struct hk_image_plane *plane, char **map)
+{
+   if (plane->bo == NULL || plane->bo_offset_B > plane->bo->size)
+      return vk_errorf(device, VK_ERROR_UNKNOWN,
+                       "host image copy used an unbound image plane");
+
+   void *bo_map = agx_bo_map_tracked(plane->bo);
+   if (bo_map == NULL) {
+      return vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+                       "failed to map host-copy image BO handle %u",
+                       plane->bo->uapi_handle);
+   }
+
+   *map = (char *)bo_map + plane->bo_offset_B;
+   return VK_SUCCESS;
+}
+
+static bool
+hk_image_plane_host_span(const struct hk_image_plane *plane, unsigned layer,
+                         unsigned level,
+                         enum hk_host_image_copy_footprint footprint,
+                         uint32_t row_stride_B, VkOffset3D offset,
+                         VkExtent3D extent,
+                         struct hk_host_image_copy_span *span)
+{
+   const struct ail_layout *layout = &plane->layout;
+   return hk_host_image_copy_span(
+      &(struct hk_host_image_copy_span_info){
+         .bo_size_B = plane->bo->size,
+         .plane_offset_B = plane->bo_offset_B,
+         .layer_level_offset_B = ail_get_layer_level_B(layout, layer, level),
+         .level_size_B = ail_get_level_size_B(layout, level),
+         .row_stride_B = row_stride_B,
+         .x_el = offset.x,
+         .y_el = offset.y,
+         .width_el = extent.width,
+         .height_el = extent.height,
+         .block_size_B = util_format_get_blocksize(layout->format),
+         .footprint = footprint,
+      },
+      span);
+}
+
+static VkResult
 hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
                         const VkMemoryToImageCopyEXT *info, bool copy_memcpy)
 {
    unsigned plane =
       hk_plane_index(dst_image->vk.format, info->imageSubresource.aspectMask);
-   const struct ail_layout *layout = &dst_image->planes[plane].layout;
+   struct hk_image_plane *dst_plane = &dst_image->planes[plane];
+   const struct ail_layout *layout = &dst_plane->layout;
+
+   char *dst_map;
+   VkResult result =
+      hk_image_plane_map_for_host_copy(device, dst_plane, &dst_map);
+   if (result != VK_SUCCESS)
+      return result;
 
    VkOffset3D offset = info->imageOffset;
    VkExtent3D extent = info->imageExtent;
@@ -1594,11 +1647,28 @@ hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
                                   : (src_width * src_height * blocksize_B);
    bool tiled = ail_is_level_twiddled_uncompressed(
       layout, info->imageSubresource.mipLevel);
+   enum hk_host_image_copy_footprint footprint =
+      copy_memcpy ? HK_HOST_IMAGE_COPY_MEMCPY_LEVEL
+                  : tiled ? HK_HOST_IMAGE_COPY_TILED_LEVEL
+                          : HK_HOST_IMAGE_COPY_LINEAR_RECT;
 
    const char *src = (const char *)info->pHostPointer;
-   char *dst = (char *)dst_image->planes[plane].map + image_offset;
+   char *dst = dst_map + image_offset;
    for (unsigned layer = 0; layer < layers;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
+      struct hk_host_image_copy_span dst_span;
+      if (!hk_image_plane_host_span(dst_plane, start_layer + layer, level,
+                                    footprint,
+                                    tiled || copy_memcpy
+                                       ? 0
+                                       : ail_get_linear_stride_B(layout, level),
+                                    offset, extent, &dst_span)) {
+         return vk_errorf(device, VK_ERROR_UNKNOWN,
+                          "host image write exceeds its bound allocation");
+      }
+      agx_bo_mark_cpu_dirty(dst_plane->bo, dst_span.offset_B, dst_span.size_B,
+                            true);
+
       if (copy_memcpy) {
          memcpy(dst, src, ail_get_level_size_B(layout, level));
       } else if (!tiled) {
@@ -1613,6 +1683,8 @@ hk_copy_memory_to_image(struct hk_device *device, struct hk_image *dst_image,
                   offset.y, extent.width, extent.height);
       }
    }
+
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1623,20 +1695,30 @@ hk_CopyMemoryToImageEXT(VkDevice _device,
    VK_FROM_HANDLE(hk_image, dst_image, info->dstImage);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
-      hk_copy_memory_to_image(device, dst_image, &info->pRegions[i],
-                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+      VkResult result = hk_copy_memory_to_image(
+         device, dst_image, &info->pRegions[i],
+         info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    return VK_SUCCESS;
 }
 
-static void
+static VkResult
 hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
                         const VkImageToMemoryCopyEXT *info, bool copy_memcpy)
 {
    unsigned plane =
       hk_plane_index(src_image->vk.format, info->imageSubresource.aspectMask);
-   const struct ail_layout *layout = &src_image->planes[plane].layout;
+   struct hk_image_plane *src_plane = &src_image->planes[plane];
+   const struct ail_layout *layout = &src_plane->layout;
+
+   char *src_map;
+   VkResult result =
+      hk_image_plane_map_for_host_copy(device, src_plane, &src_map);
+   if (result != VK_SUCCESS)
+      return result;
 
    VkOffset3D offset = info->imageOffset;
    VkExtent3D extent = info->imageExtent;
@@ -1674,11 +1756,30 @@ hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
 
    bool tiled = ail_is_level_twiddled_uncompressed(
       layout, info->imageSubresource.mipLevel);
+   enum hk_host_image_copy_footprint footprint =
+      copy_memcpy ? HK_HOST_IMAGE_COPY_MEMCPY_LEVEL
+                  : tiled ? HK_HOST_IMAGE_COPY_TILED_LEVEL
+                          : HK_HOST_IMAGE_COPY_LINEAR_RECT;
 
-   const char *src = (const char *)src_image->planes[plane].map + image_offset;
+   const char *src = src_map + image_offset;
    char *dst = (char *)info->pHostPointer;
    for (unsigned layer = 0; layer < layers;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
+      struct hk_host_image_copy_span src_span;
+      if (!hk_image_plane_host_span(src_plane, start_layer + layer, level,
+                                    footprint,
+                                    tiled || copy_memcpy
+                                       ? 0
+                                       : ail_get_linear_stride_B(layout, level),
+                                    offset, extent, &src_span)) {
+         return vk_errorf(device, VK_ERROR_UNKNOWN,
+                          "host image read exceeds its bound allocation");
+      }
+      if (agx_bo_sync_for_cpu(src_plane->bo, src_span.offset_B,
+                              src_span.size_B) != 0) {
+         return vk_device_set_lost(&device->vk,
+                                   "host image read invalidate failed");
+      }
 
       if (copy_memcpy) {
          memcpy(dst, src, dst_layer_stride);
@@ -1695,6 +1796,8 @@ hk_copy_image_to_memory(struct hk_device *device, struct hk_image *src_image,
                     dst_pitch, offset.x, offset.y, extent.width, extent.height);
       }
    }
+
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1705,25 +1808,41 @@ hk_CopyImageToMemoryEXT(VkDevice _device,
    VK_FROM_HANDLE(hk_image, image, info->srcImage);
 
    for (unsigned i = 0; i < info->regionCount; i++) {
-      hk_copy_image_to_memory(device, image, &info->pRegions[i],
-                              info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+      VkResult result = hk_copy_image_to_memory(
+         device, image, &info->pRegions[i],
+         info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    return VK_SUCCESS;
 }
 
-static void
+static VkResult
 hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
                            struct hk_image *dst_image, const VkImageCopy2 *info,
                            bool copy_memcpy)
 {
-   unsigned src_plane =
+   unsigned src_plane_index =
       hk_plane_index(src_image->vk.format, info->srcSubresource.aspectMask);
-   unsigned dst_plane =
+   unsigned dst_plane_index =
       hk_plane_index(dst_image->vk.format, info->dstSubresource.aspectMask);
 
-   const struct ail_layout *src_layout = &src_image->planes[src_plane].layout;
-   const struct ail_layout *dst_layout = &dst_image->planes[dst_plane].layout;
+   struct hk_image_plane *src_plane = &src_image->planes[src_plane_index];
+   struct hk_image_plane *dst_plane = &dst_image->planes[dst_plane_index];
+   const struct ail_layout *src_layout = &src_plane->layout;
+   const struct ail_layout *dst_layout = &dst_plane->layout;
+
+   char *src_map;
+   VkResult result =
+      hk_image_plane_map_for_host_copy(device, src_plane, &src_map);
+   if (result != VK_SUCCESS)
+      return result;
+
+   char *dst_map;
+   result = hk_image_plane_map_for_host_copy(device, dst_plane, &dst_map);
+   if (result != VK_SUCCESS)
+      return result;
 
    VkOffset3D src_offset = info->srcOffset;
    VkOffset3D dst_offset = info->dstOffset;
@@ -1760,12 +1879,46 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
       src_layout, info->srcSubresource.mipLevel);
    bool dst_tiled = ail_is_level_twiddled_uncompressed(
       dst_layout, info->dstSubresource.mipLevel);
+   enum hk_host_image_copy_footprint src_footprint =
+      copy_memcpy ? HK_HOST_IMAGE_COPY_MEMCPY_LEVEL
+                  : src_tiled ? HK_HOST_IMAGE_COPY_TILED_LEVEL
+                              : HK_HOST_IMAGE_COPY_LINEAR_RECT;
+   enum hk_host_image_copy_footprint dst_footprint =
+      copy_memcpy ? HK_HOST_IMAGE_COPY_MEMCPY_LEVEL
+                  : dst_tiled ? HK_HOST_IMAGE_COPY_TILED_LEVEL
+                              : HK_HOST_IMAGE_COPY_LINEAR_RECT;
 
-   const char *src =
-      (const char *)src_image->planes[src_plane].map + src_image_offset;
-   char *dst = (char *)dst_image->planes[dst_plane].map + dst_image_offset;
+   const char *src = src_map + src_image_offset;
+   char *dst = dst_map + dst_image_offset;
    for (unsigned layer = 0; layer < layers_to_copy;
         layer++, src += src_layer_stride, dst += dst_layer_stride) {
+      struct hk_host_image_copy_span src_span, dst_span;
+      if (!hk_image_plane_host_span(
+             src_plane, src_start_layer + layer,
+             info->srcSubresource.mipLevel, src_footprint,
+             src_tiled || copy_memcpy
+                ? 0
+                : ail_get_linear_stride_B(src_layout,
+                                          info->srcSubresource.mipLevel),
+             src_offset, extent, &src_span) ||
+          !hk_image_plane_host_span(
+             dst_plane, dst_start_layer + layer,
+             info->dstSubresource.mipLevel, dst_footprint,
+             dst_tiled || copy_memcpy
+                ? 0
+                : ail_get_linear_stride_B(dst_layout,
+                                          info->dstSubresource.mipLevel),
+             dst_offset, extent, &dst_span)) {
+         return vk_errorf(device, VK_ERROR_UNKNOWN,
+                          "host image copy exceeds a bound allocation");
+      }
+      if (agx_bo_sync_for_cpu(src_plane->bo, src_span.offset_B,
+                              src_span.size_B) != 0) {
+         return vk_device_set_lost(&device->vk,
+                                   "host image copy invalidate failed");
+      }
+      agx_bo_mark_cpu_dirty(dst_plane->bo, dst_span.offset_B, dst_span.size_B,
+                            true);
 
       if (copy_memcpy) {
          uint32_t src_size =
@@ -1828,6 +1981,8 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
           * buffer.
           */
          char *temp_tile = malloc(temp_tile_size);
+         if (temp_tile == NULL)
+            return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
          for (unsigned by = src_offset.y / block_height;
               by * block_height < src_offset.y + extent.height; by++) {
@@ -1854,6 +2009,8 @@ hk_copy_image_to_image_cpu(struct hk_device *device, struct hk_image *src_image,
          free(temp_tile);
       }
    }
+
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1872,15 +2029,19 @@ hk_CopyImageToImageEXT(VkDevice _device,
          u_foreach_bit(b, info.dstSubresource.aspectMask) {
             info.srcSubresource.aspectMask = BITFIELD_BIT(b);
             info.dstSubresource.aspectMask = BITFIELD_BIT(b);
-            hk_copy_image_to_image_cpu(device, src_image, dst_image, &info,
-                                       copy_memcpy);
+            VkResult result = hk_copy_image_to_image_cpu(
+               device, src_image, dst_image, &info, copy_memcpy);
+            if (result != VK_SUCCESS)
+               return result;
          }
          continue;
       }
 
-      hk_copy_image_to_image_cpu(device, src_image, dst_image,
-                                 pCopyImageToImageInfo->pRegions + i,
-                                 copy_memcpy);
+      VkResult result = hk_copy_image_to_image_cpu(
+         device, src_image, dst_image,
+         pCopyImageToImageInfo->pRegions + i, copy_memcpy);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    return VK_SUCCESS;
