@@ -431,8 +431,12 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 
    /* Get the shader */
    key.reserved_preamble = uniforms;
-   /* XXX: locking? */
    struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&dev->bg_eot, &key);
+
+#ifdef _WIN32
+   hk_cmd_buffer_track_bg_eot(cmd, shader->bo, shader->ptr,
+                              shader->info.binary_size);
+#endif
 
    agx_usc_pack(&b, SHADER, cfg) {
       cfg.code = agx_usc_addr(&dev->dev, shader->ptr + shader->info.main_offset);

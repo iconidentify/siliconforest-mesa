@@ -579,6 +579,11 @@ struct hk_cmd_buffer {
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+
+#ifdef _WIN32
+   /* Immutable device-global BG/EOT programs referenced by this recording. */
+   struct util_dynarray bg_eot_refs;
+#endif
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_cmd_buffer, vk.base, VkCommandBuffer,
@@ -638,6 +643,11 @@ struct agx_ptr hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
 
 uint64_t hk_pool_upload(struct hk_cmd_buffer *cmd, const void *data,
                         uint32_t size, uint32_t alignment);
+
+#ifdef _WIN32
+void hk_cmd_buffer_track_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bo *bo,
+                                uint64_t ptr, uint32_t size);
+#endif
 
 static inline struct agx_ptr
 hk_pool_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)

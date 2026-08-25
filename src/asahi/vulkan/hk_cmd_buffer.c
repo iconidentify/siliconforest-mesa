@@ -71,6 +71,9 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    }
 
    util_dynarray_clear(&cmd->large_bos);
+#ifdef _WIN32
+   util_dynarray_clear(&cmd->bg_eot_refs);
+#endif
 }
 
 static void
@@ -82,6 +85,9 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    util_dynarray_fini(&cmd->large_bos);
    hk_free_resettable_cmd_buffer(cmd);
+#ifdef _WIN32
+   util_dynarray_fini(&cmd->bg_eot_refs);
+#endif
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -114,6 +120,9 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
+#ifdef _WIN32
+   cmd->bg_eot_refs = UTIL_DYNARRAY_INIT;
+#endif
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations =
@@ -127,6 +136,41 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
 
    return VK_SUCCESS;
 }
+
+#ifdef _WIN32
+struct hk_bg_eot_ref {
+   struct agx_bo *bo;
+   uint64_t offset;
+   uint32_t size;
+};
+
+void
+hk_cmd_buffer_track_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bo *bo,
+                           uint64_t ptr, uint32_t size)
+{
+   assert(bo != NULL && bo->va != NULL);
+   assert(ptr >= bo->va->addr);
+   uint64_t offset = ptr - bo->va->addr;
+   assert(offset <= bo->size && size <= bo->size - offset);
+
+   util_dynarray_foreach(&cmd->bg_eot_refs, struct hk_bg_eot_ref, ref) {
+      if (ref->bo == bo && ref->offset == offset && ref->size == size)
+         return;
+   }
+
+   util_dynarray_append(
+      &cmd->bg_eot_refs,
+      ((struct hk_bg_eot_ref){.bo = bo, .offset = offset, .size = size}));
+}
+
+static void
+hk_cmd_buffer_publish_bg_eot(struct hk_cmd_buffer *cmd)
+{
+   util_dynarray_foreach(&cmd->bg_eot_refs, struct hk_bg_eot_ref, ref) {
+      agx_bo_mark_cpu_dirty(ref->bo, ref->offset, ref->size, true);
+   }
+}
+#endif
 
 static void
 hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
@@ -372,6 +416,15 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     */
    hk_cmd_buffer_sync_uploader(cmd, &cmd->uploader.main);
    hk_cmd_buffer_sync_uploader(cmd, &cmd->uploader.usc);
+#ifdef _WIN32
+   /* The device-global BG/EOT cache may have been first published by an
+    * unrelated queue submit long before this command buffer references it.
+    * Re-establish exact producer ownership only after recording is complete,
+    * so a concurrent submit cannot detach the range before the reference is
+    * ready to consume. The cache pool is monotonic and the programs immutable,
+    * therefore any submit which detaches this mark publishes complete bytes. */
+   hk_cmd_buffer_publish_bg_eot(cmd);
+#endif
 
    return vk_command_buffer_get_record_result(&cmd->vk);
 }
