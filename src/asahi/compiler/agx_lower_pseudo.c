@@ -76,8 +76,58 @@ lower(agx_builder *b, agx_instr *I)
    switch (I->op) {
 
    /* Various instructions are implemented as bitwise truth tables */
-   case AGX_OPCODE_MOV:
+   case AGX_OPCODE_MOV: {
+      /* A 32-bit bitop requires naturally aligned operands. Post-RA parallel
+       * copies may move an overlapping pair of 16-bit registers at an odd
+       * offset, so lower that exact case as two encodable half-register moves.
+       * Copy in memmove order because the source and destination may overlap. */
+      bool move32 = I->dest[0].size == AGX_SIZE_32 &&
+                    I->src[0].size == AGX_SIZE_32;
+      bool unaligned_dest = move32 &&
+                            I->dest[0].type == AGX_INDEX_REGISTER &&
+                            (I->dest[0].value & 1);
+      bool unaligned_src = move32 &&
+                           I->src[0].type == AGX_INDEX_REGISTER &&
+                           (I->src[0].value & 1);
+
+      if (unaligned_dest || unaligned_src) {
+         assert(I->dest[0].type == AGX_INDEX_REGISTER);
+         assert(I->dest[0].size == AGX_SIZE_32);
+         assert(I->src[0].type == AGX_INDEX_REGISTER ||
+                I->src[0].type == AGX_INDEX_UNIFORM);
+         assert(I->src[0].size == AGX_SIZE_32);
+
+         agx_index dst = I->dest[0];
+         agx_index src = I->src[0];
+         dst.size = AGX_SIZE_16;
+         src.size = AGX_SIZE_16;
+
+         bool high_first = src.type == AGX_INDEX_REGISTER &&
+                           dst.memory == src.memory &&
+                           dst.value > src.value &&
+                           dst.value < (src.value + 2);
+
+         if (high_first) {
+            dst.value++;
+            src.value++;
+            agx_bitop_to(b, dst, src, agx_zero(), UTIL_LUT2(a));
+            dst.value--;
+            src.value--;
+         }
+
+         agx_bitop_to(b, dst, src, agx_zero(), UTIL_LUT2(a));
+
+         if (!high_first) {
+            dst.value++;
+            src.value++;
+            agx_bitop_to(b, dst, src, agx_zero(), UTIL_LUT2(a));
+         }
+
+         return (void *)true;
+      }
+
       return agx_bitop_to(b, I->dest[0], I->src[0], agx_zero(), UTIL_LUT2(a));
+   }
 
    case AGX_OPCODE_NOT:
       return agx_bitop_to(b, I->dest[0], I->src[0], agx_zero(), UTIL_LUT2(~a));
