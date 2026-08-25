@@ -133,7 +133,7 @@ agx_bg_eot_file_append(const char *text, size_t length)
       return;
 
    HANDLE file =
-      CreateFileA(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+      CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
    if (file == INVALID_HANDLE_VALUE)
@@ -148,8 +148,18 @@ agx_bg_eot_file_append(const char *text, size_t length)
    if (GetFileSizeEx(file, &file_size) && file_size.QuadPart >= 0 &&
        (uint64_t)file_size.QuadPart <= AGX_BG_EOT_LOG_LIMIT &&
        length <= AGX_BG_EOT_LOG_LIMIT - (uint64_t)file_size.QuadPart) {
-      DWORD ignored;
-      (void)WriteFile(file, text, (DWORD)length, &ignored, NULL);
+      LARGE_INTEGER zero = {0};
+      LARGE_INTEGER append_position;
+
+      if (SetFilePointerEx(file, zero, &append_position, FILE_END)) {
+         DWORD written = 0;
+         bool complete = WriteFile(file, text, (DWORD)length, &written, NULL) &&
+                         written == length;
+
+         if (!complete &&
+             SetFilePointerEx(file, append_position, NULL, FILE_BEGIN))
+            (void)SetEndOfFile(file);
+      }
    }
 
    (void)UnlockFileEx(file, 0, 1, 0, &lock);
