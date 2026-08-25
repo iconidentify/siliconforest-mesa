@@ -2482,7 +2482,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
    simple_mtx_lock(&ws->lock);
    ctx->staging_retire[staging_slot] = retire;
-   ctx->staging_slot = (staging_slot + 1) % AGX_D3DKMT_STAGING_RING;
+   ctx->staging_slot = agx_d3dkmt_staging_next(staging_slot);
    simple_mtx_unlock(&ws->lock);
    ret = 0;
 

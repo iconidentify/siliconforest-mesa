@@ -48,6 +48,24 @@ static int checks;
       }                                                                        \
    } while (0)
 
+static void
+test_staging_ring_depth_and_wrap(void)
+{
+   bool seen[AGX_D3DKMT_STAGING_RING] = {false};
+   uint32_t slot = 0;
+
+   for (uint32_t i = 0; i < AGX_D3DKMT_STAGING_RING; ++i) {
+      CHECK(slot < AGX_D3DKMT_STAGING_RING);
+      CHECK(!seen[slot]);
+      seen[slot] = true;
+      slot = agx_d3dkmt_staging_next(slot);
+   }
+
+   CHECK_EQ(slot, 0);
+   for (uint32_t i = 0; i < AGX_D3DKMT_STAGING_RING; ++i)
+      CHECK(seen[i]);
+}
+
 /* ------------------------------------------------------------------------ */
 static void
 test_handle_pool_is_dense(void)
@@ -1552,6 +1570,7 @@ test_contract_blobs_we_emit(void)
 int
 main(void)
 {
+   test_staging_ring_depth_and_wrap();
    test_handle_pool_is_dense();
    test_cpu_visible_executable_flags();
    test_bind_plain();

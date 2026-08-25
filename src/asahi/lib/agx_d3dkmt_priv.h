@@ -23,13 +23,11 @@
  * hk_queue.c builds the flat drm_asahi_cmd_header + payload stream in a
  * util_dynarray of plain host memory and hands the winsys a userspace pointer
  * (hk_queue.c:864-872). D3DKMTSubmitCommand instead takes a GPU virtual
- * address, so the winsys copies the stream into a GPU-mapped BO. Two buffers
- * per context are enough to keep the CPU one submission ahead of the GPU
- * without unbounded memory; the ring slot is not reused until the context
- * fence proves the previous submission that used it has retired.
+ * address, so the winsys copies the stream into a GPU-mapped BO. The bounded
+ * ring covers DXVK's maximum queued command-buffer depth; a slot is not
+ * reused until the context fence proves the previous submission that used it
+ * has retired.
  */
-#define AGX_D3DKMT_STAGING_RING 2
-
 struct agx_d3dkmt_submit_blob {
    struct agxw_submit_private_v5 header;
    struct agxw_submit_read_range ranges[2 * AGXW_MAX_READ_RANGES_PER_SUBMIT];

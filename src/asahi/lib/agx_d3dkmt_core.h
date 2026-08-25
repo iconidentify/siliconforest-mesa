@@ -70,6 +70,19 @@ extern "C" {
 #define AGX_D3DKMT_USC_MIN_BASE  UINT64_C(0x1100000000)
 
 /*
+ * Keep enough GPU-mapped command buffers to cover DXVK's maximum queued
+ * command-buffer depth. Each slot remains owned by its submission until the
+ * private context fence reaches that slot's retire value.
+ */
+#define AGX_D3DKMT_STAGING_RING 32u
+
+static inline uint32_t
+agx_d3dkmt_staging_next(uint32_t slot)
+{
+   return (slot + 1u) % AGX_D3DKMT_STAGING_RING;
+}
+
+/*
  * Runtime policy: contract answers that may legitimately differ per adapter or
  * per contract revision, kept out of the call sites so reconciling them is a
  * data change.
