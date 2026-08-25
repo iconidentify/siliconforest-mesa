@@ -420,24 +420,27 @@ struct agx_bg_eot_shader *
 agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
                       struct agx_bg_eot_key *key)
 {
+   simple_mtx_lock(&cache->lock);
+
    struct hash_entry *ent = _mesa_hash_table_search(cache->ht, key);
-   if (ent)
-      return ent->data;
+   struct agx_bg_eot_shader *ret = ent ? ent->data : NULL;
 
-   struct agx_bg_eot_shader *ret = NULL;
-
-   for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt) {
-      if (key->op[rt] == AGX_EOT_STORE) {
-         ret = agx_build_end_of_tile_shader(cache, key);
-         break;
+   if (!ret) {
+      for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt) {
+         if (key->op[rt] == AGX_EOT_STORE) {
+            ret = agx_build_end_of_tile_shader(cache, key);
+            break;
+         }
       }
+
+      if (!ret)
+         ret = agx_build_background_shader(cache, key);
+
+      ret->key = *key;
+      _mesa_hash_table_insert(cache->ht, &ret->key, ret);
    }
 
-   if (!ret)
-      ret = agx_build_background_shader(cache, key);
-
-   ret->key = *key;
-   _mesa_hash_table_insert(cache->ht, &ret->key, ret);
+   simple_mtx_unlock(&cache->lock);
    return ret;
 }
 

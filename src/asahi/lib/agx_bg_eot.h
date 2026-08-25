@@ -60,6 +60,7 @@ struct agx_bg_eot_shader {
    uint64_t ptr;
 };
 
+/* Get a generated background/end-of-tile shader. This is thread-safe. */
 struct agx_bg_eot_shader *agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
                                                 struct agx_bg_eot_key *key);
 
