@@ -231,11 +231,12 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
    assert(offset <= HK_CMD_BO_SIZE);
    if (uploader->map != NULL && size <= HK_CMD_BO_SIZE - offset) {
       uploader->offset = offset + size;
+      uploader->bo->used = MAX2(uploader->bo->used, uploader->offset);
 
       /* Upload storage is monotonic for a recording. The returned interval is
        * its complete CPU-writable extent and cannot be mutated while pending.
        */
-      agx_bo_mark_cpu_dirty(uploader->bo, offset, size, true);
+      agx_bo_mark_cpu_dirty(uploader->bo->bo, offset, size, true);
 
       return (struct agx_ptr){
          .gpu = uploader->base + offset,
@@ -257,12 +258,16 @@ hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
     * BO.
     */
    if (uploader->map == NULL || size < uploader->offset) {
-      uploader->bo = bo->bo;
+      uploader->bo = bo;
       uploader->map = bo->map;
       uploader->base = bo->bo->va->addr;
       uploader->offset = size;
    }
 
+   /* This includes a new BO burned on one allocation while the old uploader
+    * remains current.
+    */
+   bo->used = size;
    agx_bo_mark_cpu_dirty(bo->bo, 0, size, true);
 
    return (struct agx_ptr){
@@ -323,6 +328,17 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
    }
 }
 
+static void
+hk_cmd_buffer_sync_uploader(struct hk_cmd_buffer *cmd,
+                            struct hk_uploader *uploader)
+{
+   list_for_each_entry(struct hk_cmd_bo, bo, &uploader->bos, link) {
+      assert(bo->used <= HK_CMD_BO_SIZE);
+      if (bo->used && agx_bo_sync_for_device(bo->bo, 0, bo->used))
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_DEVICE_LOST);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
@@ -349,6 +365,13 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
          cs->current = agx_cdm_terminate(cs->current);
       }
    }
+
+   /* Publish after every recording-time write, including CDM merge links and
+    * terminates above. This closes the window where an unrelated submit can
+    * detach an allocation-time dirty mark before its CPU write completes.
+    */
+   hk_cmd_buffer_sync_uploader(cmd, &cmd->uploader.main);
+   hk_cmd_buffer_sync_uploader(cmd, &cmd->uploader.usc);
 
    return vk_command_buffer_get_record_result(&cmd->vk);
 }

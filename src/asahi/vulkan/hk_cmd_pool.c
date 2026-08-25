@@ -104,11 +104,16 @@ hk_cmd_pool_alloc_bo(struct hk_cmd_pool *pool, bool usc,
    }
    if (bo) {
       list_del(&bo->link);
+      bo->used = 0;
       *bo_out = bo;
       return VK_SUCCESS;
    }
 
-   return hk_cmd_bo_create(pool, usc, bo_out);
+   VkResult result = hk_cmd_bo_create(pool, usc, bo_out);
+   if (result == VK_SUCCESS)
+      (*bo_out)->used = 0;
+
+   return result;
 }
 
 void

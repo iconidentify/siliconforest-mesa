@@ -20,6 +20,9 @@ struct hk_cmd_bo {
 
    void *map;
 
+   /** Exact high-water written during the current recording */
+   uint32_t used;
+
    /** Link in hk_cmd_pool::free_bos or hk_cmd_buffer::bos */
    struct list_head link;
 };
