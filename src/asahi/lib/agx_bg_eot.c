@@ -4,11 +4,17 @@
  */
 
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 
-#include "agx_bg_eot.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
+#include "agx_bg_eot.h"
 #include "agx_compile.h"
 #include "agx_device.h"
 #include "agx_nir.h"
@@ -34,20 +40,26 @@ lower_tex_handle_to_u0(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+#if AGX_GPU_DIAG >= 2
+static bool agx_bg_eot_log_opt_in;
+
+static void
+agx_bg_eot_log_init_once(void)
+{
+   const char *value = getenv("NTAGX_BG_EOT_LOG");
+   agx_bg_eot_log_opt_in = value != NULL && value[0] != '\0' && value[0] != '0';
+}
+
 static bool
 agx_bg_eot_log_enabled(void)
 {
-#if AGX_GPU_DIAG >= 2
-   const char *value = getenv("NTAGX_BG_EOT_LOG");
-   return value != NULL && value[0] != '\0' && value[0] != '0';
-#else
-   return false;
-#endif
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, agx_bg_eot_log_init_once);
+   return agx_bg_eot_log_opt_in;
 }
 
 static uint32_t
-agx_bg_eot_hash(const volatile uint8_t *bytes, size_t size,
-                size_t *nonzero_out)
+agx_bg_eot_hash(const volatile uint8_t *bytes, size_t size, size_t *nonzero_out)
 {
    uint32_t hash = UINT32_C(2166136261);
    size_t nonzero = 0;
@@ -63,16 +75,150 @@ agx_bg_eot_hash(const volatile uint8_t *bytes, size_t size,
    return hash;
 }
 
+struct agx_bg_eot_log_record {
+   char text[1536];
+   size_t length;
+};
+
 static void
-agx_bg_eot_print_head(const char *kind, const volatile uint8_t *bytes,
-                      size_t size)
+agx_bg_eot_record_append(struct agx_bg_eot_log_record *record,
+                         const char *format, ...)
 {
-   size_t show = MIN2(size, 32);
-   fprintf(stderr, "NTAGX_BG_EOT: %s head", kind);
-   for (size_t i = 0; i < show; i++)
-      fprintf(stderr, " %02x", bytes[i]);
-   fprintf(stderr, "\n");
+   if (record->length >= sizeof(record->text) - 1)
+      return;
+
+   size_t available = sizeof(record->text) - record->length;
+   va_list ap;
+   va_start(ap, format);
+   int written =
+      vsnprintf(record->text + record->length, available, format, ap);
+   va_end(ap);
+   if (written < 0)
+      return;
+
+   record->length += MIN2((size_t)written, available - 1);
 }
+
+static void
+agx_bg_eot_record_head(struct agx_bg_eot_log_record *record, const char *kind,
+                       const volatile uint8_t *bytes, size_t size)
+{
+   agx_bg_eot_record_append(record, "NTAGX_BG_EOT: %s_head=", kind);
+   if (bytes == NULL) {
+      agx_bg_eot_record_append(record, "unavailable\n");
+      return;
+   }
+
+   size_t show = MIN2(size, 32);
+   for (size_t i = 0; i < show; i++)
+      agx_bg_eot_record_append(record, "%02x", bytes[i]);
+   agx_bg_eot_record_append(record, "\n");
+}
+
+#ifdef _WIN32
+#define AGX_BG_EOT_LOG_LIMIT (4u * 1024u * 1024u)
+
+static void
+agx_bg_eot_file_append(const char *text, size_t length)
+{
+   const char root[] = "C:\\aurora";
+   const char directory[] = "C:\\aurora\\logs";
+   const char path[] = "C:\\aurora\\logs\\agx-bg-eot.log";
+   OVERLAPPED lock = {0};
+
+   if ((!CreateDirectoryA(root, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) ||
+       (!CreateDirectoryA(directory, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS))
+      return;
+
+   HANDLE file =
+      CreateFileA(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (file == INVALID_HANDLE_VALUE)
+      return;
+
+   if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &lock)) {
+      CloseHandle(file);
+      return;
+   }
+
+   LARGE_INTEGER file_size;
+   if (GetFileSizeEx(file, &file_size) && file_size.QuadPart >= 0 &&
+       (uint64_t)file_size.QuadPart <= AGX_BG_EOT_LOG_LIMIT &&
+       length <= AGX_BG_EOT_LOG_LIMIT - (uint64_t)file_size.QuadPart) {
+      DWORD ignored;
+      (void)WriteFile(file, text, (DWORD)length, &ignored, NULL);
+   }
+
+   (void)UnlockFileEx(file, 0, 1, 0, &lock);
+   CloseHandle(file);
+}
+#endif
+
+static void
+agx_bg_eot_log_shader(unsigned stage, const struct agx_bo *bo,
+                      uint64_t compile_gpu, size_t bo_offset,
+                      const struct agx_shader_part *bin,
+                      const volatile uint8_t *mapped, bool bounds_ok,
+                      size_t source_nonzero, uint32_t source_hash,
+                      size_t mapped_nonzero, uint32_t mapped_hash,
+                      size_t source_main_nonzero, uint32_t source_main_hash,
+                      size_t mapped_main_nonzero, uint32_t mapped_main_hash)
+{
+   struct agx_bg_eot_log_record record = {0};
+   uint64_t code_gpu = compile_gpu + bin->info.main_offset;
+
+#ifdef _WIN32
+   SYSTEMTIME now;
+   GetSystemTime(&now);
+   agx_bg_eot_record_append(
+      &record,
+      "NTAGX_BG_EOT: utc=%04u-%02u-%02uT%02u:%02u:%02u.%03uZ "
+      "pid=%lu tid=%lu ",
+      (unsigned)now.wYear, (unsigned)now.wMonth, (unsigned)now.wDay,
+      (unsigned)now.wHour, (unsigned)now.wMinute, (unsigned)now.wSecond,
+      (unsigned)now.wMilliseconds, (unsigned long)GetCurrentProcessId(),
+      (unsigned long)GetCurrentThreadId());
+#else
+   agx_bg_eot_record_append(&record, "NTAGX_BG_EOT: ");
+#endif
+   agx_bg_eot_record_append(
+      &record,
+      "stage=%u handle=%u compile_gpu=0x%" PRIx64 " code_gpu=0x%" PRIx64
+      " bo_offset=0x%zx bo_size=%zu "
+      "binary_size=%u main_offset=%u main_size=%u bounds=%u mapped=%u "
+      "source_full_nonzero=%zu source_full_fnv=%08x "
+      "mapped_full_nonzero=%zu mapped_full_fnv=%08x "
+      "source_main_nonzero=%zu source_main_fnv=%08x "
+      "mapped_main_nonzero=%zu mapped_main_fnv=%08x\n",
+      stage, bo != NULL ? (unsigned)bo->uapi_handle : 0, compile_gpu, code_gpu,
+      bo_offset, bo != NULL ? bo->size : 0, bin->info.binary_size,
+      bin->info.main_offset, bin->info.main_size, bounds_ok ? 1u : 0u,
+      mapped != NULL ? 1u : 0u, source_nonzero, source_hash, mapped_nonzero,
+      mapped_hash, source_main_nonzero, source_main_hash, mapped_main_nonzero,
+      mapped_main_hash);
+   agx_bg_eot_record_head(&record, "source_full", bin->binary,
+                          bin->info.binary_size);
+   agx_bg_eot_record_head(&record, "mapped_full", mapped,
+                          bin->info.binary_size);
+   agx_bg_eot_record_head(
+      &record, "source_main",
+      bounds_ok ? bin->binary + bin->info.main_offset : NULL,
+      bounds_ok ? bin->info.main_size : 0);
+   agx_bg_eot_record_head(
+      &record, "mapped_main",
+      bounds_ok && mapped != NULL ? mapped + bin->info.main_offset : NULL,
+      bounds_ok ? bin->info.main_size : 0);
+
+   (void)fwrite(record.text, 1, record.length, stderr);
+   fflush(stderr);
+#ifdef _WIN32
+   agx_bg_eot_file_append(record.text, record.length);
+#endif
+}
+#endif
 
 static struct agx_bg_eot_shader *
 agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
@@ -100,6 +246,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
    res->ptr = agx_pool_upload_aligned_with_bo(
       &cache->pool, bin.binary, bin.info.binary_size, 128, &res->bo);
 
+#if AGX_GPU_DIAG >= 2
    if (agx_bg_eot_log_enabled()) {
       size_t size = bin.info.binary_size;
       size_t offset = (res->bo != NULL && res->bo->va != NULL &&
@@ -115,35 +262,26 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
             : NULL;
       size_t source_nonzero = 0, mapped_nonzero = 0;
       size_t source_main_nonzero = 0, mapped_main_nonzero = 0;
-      uint32_t source_hash = agx_bg_eot_hash(bin.binary, size,
-                                             &source_nonzero);
-      uint32_t mapped_hash = mapped != NULL
-                                ? agx_bg_eot_hash(mapped, size, &mapped_nonzero)
-                                : 0;
-      uint32_t source_main_hash = bounds_ok
-           ? agx_bg_eot_hash(bin.binary + bin.info.main_offset,
-                             bin.info.main_size, &source_main_nonzero) : 0;
-      uint32_t mapped_main_hash = bounds_ok && mapped != NULL
-           ? agx_bg_eot_hash(mapped + bin.info.main_offset,
-                             bin.info.main_size, &mapped_main_nonzero) : 0;
+      uint32_t source_hash = agx_bg_eot_hash(bin.binary, size, &source_nonzero);
+      uint32_t mapped_hash =
+         mapped != NULL ? agx_bg_eot_hash(mapped, size, &mapped_nonzero) : 0;
+      uint32_t source_main_hash =
+         bounds_ok ? agx_bg_eot_hash(bin.binary + bin.info.main_offset,
+                                     bin.info.main_size, &source_main_nonzero)
+                   : 0;
+      uint32_t mapped_main_hash =
+         bounds_ok && mapped != NULL
+            ? agx_bg_eot_hash(mapped + bin.info.main_offset, bin.info.main_size,
+                              &mapped_main_nonzero)
+            : 0;
 
-      fprintf(stderr,
-              "NTAGX_BG_EOT: stage=%u handle=%u gpu=0x%" PRIx64
-              " bo_offset=0x%zx size=%zu main_offset=%u main_size=%u "
-              "source=%zu/%08x mapped=%zu/%08x "
-              "source_main=%zu/%08x mapped_main=%zu/%08x bounds=%u\n",
-              (unsigned)bin.info.stage,
-              res->bo != NULL ? (unsigned)res->bo->uapi_handle : 0,
-              res->ptr, offset, size, bin.info.main_offset,
-              bin.info.main_size, source_nonzero, source_hash,
-              mapped_nonzero, mapped_hash, source_main_nonzero,
-              source_main_hash, mapped_main_nonzero, mapped_main_hash,
-              bounds_ok ? 1u : 0u);
-      agx_bg_eot_print_head("source", bin.binary, size);
-      if (mapped != NULL)
-         agx_bg_eot_print_head("mapped", mapped, size);
-      fflush(stderr);
+      agx_bg_eot_log_shader((unsigned)bin.info.stage, res->bo, res->ptr, offset,
+                            &bin, mapped, bounds_ok, source_nonzero,
+                            source_hash, mapped_nonzero, mapped_hash,
+                            source_main_nonzero, source_main_hash,
+                            mapped_main_nonzero, mapped_main_hash);
    }
+#endif
    free(bin.binary);
    ralloc_free(shader);
 
