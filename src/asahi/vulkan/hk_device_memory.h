@@ -16,6 +16,13 @@
 struct hk_device;
 struct hk_image_plane;
 
+/* Driver-private bit in asahi_ccmd_submit_res::flags (stripped before it is
+ * sent to the host) marking BOs imported from outside the driver. These always
+ * get implicit sync in both directions, as the other party may rely on it even
+ * when no shareable sync object is used.
+ */
+#define HK_EXTRES_FOREIGN 0x80000000u
+
 struct hk_device_memory {
    struct vk_device_memory vk;
 

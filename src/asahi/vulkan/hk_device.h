@@ -103,6 +103,11 @@ struct hk_device {
       struct u_rwlock lock;
       struct util_dynarray list;
       struct util_dynarray counts;
+
+      /* Number of list entries marked HK_EXTRES_FOREIGN. Updated under the
+       * write lock, read locklessly as a fast-path hint.
+       */
+      unsigned foreign_count;
    } external_bos;
 };
 

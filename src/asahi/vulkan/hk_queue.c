@@ -22,12 +22,14 @@
 #include "decode.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_device_memory.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
 #include <xf86drm.h>
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/u_atomic.h"
 #include "util/u_dynarray.h"
 #include "vulkan/vulkan_core.h"
 
@@ -258,21 +260,46 @@ max_commands_per_submit(struct hk_device *dev)
 
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned ring_idx)
+                    unsigned ring_idx, unsigned extres_flags,
+                    unsigned foreign_flags)
 {
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
+   struct util_dynarray extres = UTIL_DYNARRAY_INIT;
 
-   if (dev->dev.is_virtio) {
+   /* Skip everything when this submit has no shareable syncs and no imported
+    * BO exists on the device.
+    */
+   if (!p_atomic_read(&dev->external_bos.foreign_count))
+      foreign_flags = 0;
+
+   if (dev->dev.is_virtio && (extres_flags || foreign_flags)) {
       u_rwlock_rdlock(&dev->external_bos.lock);
+
+      /* Restrict the implicit sync to the requested directions. Imported BOs
+       * may be implicitly synchronized with their producer/consumer without
+       * any shareable sync being involved, so they use their own mask.
+       */
+      util_dynarray_foreach(&dev->external_bos.list,
+                            struct asahi_ccmd_submit_res, res) {
+         struct asahi_ccmd_submit_res out = *res;
+         out.flags &= (res->flags & HK_EXTRES_FOREIGN) ? foreign_flags
+                                                      : extres_flags;
+         out.flags &= ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
+
+         if (out.flags)
+            util_dynarray_append(&extres, out);
+      }
+
+      u_rwlock_rdunlock(&dev->external_bos.lock);
+
       virt.extres_count = util_dynarray_num_elements(
-         &dev->external_bos.list, struct asahi_ccmd_submit_res);
-      virt.extres = util_dynarray_begin(&dev->external_bos.list);
+         &extres, struct asahi_ccmd_submit_res);
+      virt.extres = util_dynarray_begin(&extres);
    }
 
    int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
 
-   if (dev->dev.is_virtio)
-      u_rwlock_rdunlock(&dev->external_bos.lock);
+   util_dynarray_fini(&extres);
 
    /* XXX: don't trap */
    if (ret) {
@@ -291,7 +318,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
  */
 static VkResult
 queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned command_count, unsigned ring_idx)
+                    unsigned command_count, unsigned ring_idx,
+                    unsigned extres_flags, unsigned foreign_flags)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -364,7 +392,17 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
          .out_sync_count = has_out_syncs ? submit->out_sync_count : 0,
       };
 
-      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx);
+      /* The external resource sync only needs to wrap the whole submission:
+       * the first ioctl waits on the implicit fences (and, as the scheduler
+       * runs a queue's jobs in order, covers the following ones) and the last
+       * ioctl publishes the final fence.
+       */
+      const unsigned ioctl_mask =
+         (first ? ASAHI_EXTRES_READ : 0) | (last ? ASAHI_EXTRES_WRITE : 0);
+
+      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx,
+                                            extres_flags & ioctl_mask,
+                                            foreign_flags & ioctl_mask);
       if (result != VK_SUCCESS)
          return result;
 
@@ -733,6 +771,37 @@ hk_queue_submit_bind_sparse_memory(struct hk_device *device,
    return VK_SUCCESS;
 }
 
+/*
+ * Under virtio, shared BOs are implicitly synchronized by the host on every
+ * submit that carries them, which chains each job to the previous one and
+ * stops the kernel from keeping more than one job in flight. Only submits that
+ * wait on or signal shareable syncs (i.e. WSI) can involve them, so don't pay
+ * for it on the rest: waiting submits need the implicit fences of the BOs
+ * (READ), signalling submits need to publish their fence on them (WRITE).
+ *
+ * This only applies to BOs we exported ourselves (e.g. WSI images). BOs
+ * imported from outside keep full implicit sync on every submit, see
+ * HK_EXTRES_FOREIGN.
+ */
+static unsigned
+submit_extres_flags(struct vk_queue_submit *submit)
+{
+   const unsigned mask = VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED;
+   unsigned flags = 0;
+
+   for (unsigned i = 0; i < submit->wait_count; ++i) {
+      if (submit->waits[i].sync->flags & mask)
+         flags |= ASAHI_EXTRES_READ;
+   }
+
+   for (unsigned i = 0; i < submit->signal_count; ++i) {
+      if (submit->signals[i].sync->flags & mask)
+         flags |= ASAHI_EXTRES_WRITE;
+   }
+
+   return flags;
+}
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
@@ -870,13 +939,18 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .cmdbuf = (uint64_t)(uintptr_t)(payload.data),
    };
 
+   const unsigned extres_flags = submit_extres_flags(submit);
+   const unsigned foreign_flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
+
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
-      result =
-         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
+      result = queue_submit_single(dev, &submit_ioctl,
+                                   queue->drm.virt_ring_idx, extres_flags,
+                                   foreign_flags);
    } else {
       result = queue_submit_looped(dev, &submit_ioctl, command_count,
-                                   queue->drm.virt_ring_idx);
+                                   queue->drm.virt_ring_idx, extres_flags,
+                                   foreign_flags);
    }
 
    util_dynarray_fini(&payload);

@@ -50,7 +50,8 @@ hk_memory_type_flags(const VkMemoryType *type,
 }
 
 static void
-hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
+hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo,
+                     bool imported)
 {
    uint32_t id = bo->uapi_handle;
 
@@ -62,6 +63,11 @@ hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
          &dev->external_bos.list, struct asahi_ccmd_submit_res, i);
 
       if (p->res_id == id) {
+         if (imported && !(p->flags & HK_EXTRES_FOREIGN)) {
+            p->flags |= HK_EXTRES_FOREIGN;
+            p_atomic_inc(&dev->external_bos.foreign_count);
+         }
+
          ++*util_dynarray_element(&dev->external_bos.counts, unsigned, i);
          return;
       }
@@ -69,18 +75,22 @@ hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
 
    struct asahi_ccmd_submit_res res = {
       .res_id = id,
-      .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE,
+      .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE |
+               (imported ? HK_EXTRES_FOREIGN : 0),
    };
+   if (imported)
+      p_atomic_inc(&dev->external_bos.foreign_count);
+
    util_dynarray_append(&dev->external_bos.list, res);
    util_dynarray_append_typed(&dev->external_bos.counts, unsigned, 1);
 }
 
 static void
-hk_add_ext_bo(struct hk_device *dev, struct agx_bo *bo)
+hk_add_ext_bo(struct hk_device *dev, struct agx_bo *bo, bool imported)
 {
    if (dev->dev.is_virtio) {
       u_rwlock_wrlock(&dev->external_bos.lock);
-      hk_add_ext_bo_locked(dev, bo);
+      hk_add_ext_bo_locked(dev, bo, imported);
       u_rwlock_wrunlock(&dev->external_bos.lock);
    }
 }
@@ -100,6 +110,9 @@ hk_remove_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
          unsigned *ctr =
             util_dynarray_element(&dev->external_bos.counts, unsigned, i);
          if (!--*ctr) {
+            if (p->flags & HK_EXTRES_FOREIGN)
+               p_atomic_dec(&dev->external_bos.foreign_count);
+
             *ctr = util_dynarray_pop(&dev->external_bos.counts, unsigned);
             *p = util_dynarray_pop(&dev->external_bos.list,
                                    struct asahi_ccmd_submit_res);
@@ -228,7 +241,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       return VK_ERROR_UNKNOWN;
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
-      hk_add_ext_bo(dev, mem->bo);
+      hk_add_ext_bo(dev, mem->bo, fd_info && fd_info->handleType);
 
    if (fd_info && fd_info->handleType) {
       /* From the Vulkan spec:
