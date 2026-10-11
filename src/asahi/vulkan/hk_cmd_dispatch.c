@@ -128,6 +128,14 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
+
+   /* A meta operation (an image copy with several regions, for one) writes
+    * through the same caches in consecutive launches that the app declared no
+    * dependency between; each write must reach memory before the next launch,
+    * as it did when every launch flushed.
+    */
+   if (cs->cmd->in_meta)
+      cs->cmd->state.cs.cdm_barrier_pending = true;
 }
 
 void
