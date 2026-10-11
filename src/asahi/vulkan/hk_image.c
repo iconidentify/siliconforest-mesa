@@ -919,6 +919,7 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
 
    if (sparse_bound) {
       p_atomic_set(&dev->sparse_used, 1);
+      fprintf(stderr, "HK-DBG sparse_used set by image\n");
       size_t size = align(plane->layout.size_B, HK_SPARSE_ALIGN_B);
       plane->va = agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
       plane->addr = plane->va->addr;
