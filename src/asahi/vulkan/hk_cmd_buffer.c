@@ -802,6 +802,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
    agx_usc_words_precomp(t.cpu, &prog->b, uploaded_data, data_size);
 
+   if (barrier & (AGX_PREGFX | AGX_POSTGFX))
+      hk_cmd_buffer_untrack_cdm(cmd);
    /* An internal full-barrier launch orders in both directions: drain the
     * producers before it, and drain its own output right after it. The
     * consumer is often a draw (the tessellation and geometry outputs of an
