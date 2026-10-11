@@ -128,6 +128,7 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
+   cs->cdm_flush_pending = true;
 }
 
 void
