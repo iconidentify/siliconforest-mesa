@@ -85,12 +85,25 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 void
 hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   if (cs->type == HK_CS_CDM && cs->cdm_flush_pending) {
+   if (cs->type != HK_CS_CDM)
+      return;
+
+   if (cs->cdm_flush_pending) {
       hk_ensure_cs_has_space(cmd, cs, 0x2000);
       cs->current = agx_cdm_barrier_deferred(cs->current,
                                              hk_cmd_buffer_device(cmd)->dev.chip);
       cs->stats.flushes++;
       cs->cdm_flush_pending = false;
+   } else if (cmd->state.cs.cdm_barrier_pending) {
+      /* A vkCmdPipelineBarrier was recorded after the last launch of this
+       * stream and the next consumer may be a render pass or another batch
+       * that no launch of ours precedes, so the launch-time flush never runs.
+       * Drain the stream's last launches here. The flag stays set: this
+       * function also ends internal streams while the main stream is still
+       * open, and that stream needs its own tail flush.
+       */
+      hk_ensure_cs_has_space(cmd, cs, 0x2000);
+      hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
    }
 }
 
