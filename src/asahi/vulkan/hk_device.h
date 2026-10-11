@@ -104,6 +104,8 @@ struct hk_device {
    /* HK_CDM_DEFER_FLUSH (hk_device.c): emit the CDM barrier at the end of
     * each compute batch, not after vkCmdPipelineBarrier2. */
    bool cdm_defer_flush;
+   /* Set to 1 when the app creates a sparse image or buffer; never cleared. */
+   uint32_t sparse_used;
 
    struct {
       struct u_rwlock lock;
