@@ -74,7 +74,7 @@ def bad(got, want):
 def run(spv, driver, base, path):
     path.with_suffix(".in").write_bytes(np.array([base, SEED], dtype=np.uint32).tobytes())
     env = dict(os.environ, VK_DRIVER_FILES=driver, VK_ICD_FILENAMES=driver, MESA_SHADER_CACHE_DISABLE="true")
-    subprocess.run(["flock", "-w", "1800", "/tmp/m1-gpu.lock", runner, str(spv), str(path.with_suffix(".in")),
+    subprocess.run(["flock", "-w", "1800", "/tmp/gpu.lock", runner, str(spv), str(path.with_suffix(".in")),
                     str(path), str(N * 8), str(N // 32 // 64)], env=env, check=True, timeout=2100)
     return np.fromfile(path, dtype=np.uint32).reshape(N, 2)
 

@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix="large-constants-") as td:
         env.pop("HK_LARGE_CONSTANTS", None)
         if not on:
             env["HK_LARGE_CONSTANTS"] = "0"
-        r = subprocess.run(["flock", "-w", "1800", "/tmp/m1-gpu.lock", runner, str(td / "p.spv"),
+        r = subprocess.run(["flock", "-w", "1800", "/tmp/gpu.lock", runner, str(td / "p.spv"),
                             str(td / "in.bin"), str(td / "out.bin"), str(n * 4), str(N_WG)],
                            env=env, capture_output=True, text=True, timeout=2100)
         stats = [l for l in (r.stdout + r.stderr).splitlines() if l.startswith("CS shader")]
