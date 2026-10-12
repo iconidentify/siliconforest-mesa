@@ -778,7 +778,15 @@ agx_open_device(void *memctx, struct agx_device *dev)
       dev->params.num_clusters_total == 2 && dev->params.usc_generation == 3 &&
       dev->params.gpu_hal_generation == 0 &&
       debug_get_bool_option("ASAHI_M3_EXPERIMENTAL", false);
-   if (!m3_experimental && !m4_experimental && !agx_params_driver_supported(&dev->params)) {
+   /* M3 Max (J516C): the G15C as the kernel reports it, one die of four
+    * ten-core clusters, behind the same switch as the M3 Pro. */
+   const bool m3max_experimental = dev->chip == AGX_CHIP_G15C &&
+      dev->params.chip_id == 0x6031 && dev->params.num_dies == 1 &&
+      dev->params.num_clusters_total == 4 && dev->params.usc_generation == 3 &&
+      dev->params.gpu_hal_generation == 0 &&
+      debug_get_bool_option("ASAHI_M3_EXPERIMENTAL", false);
+   if (!m3_experimental && !m3max_experimental && !m4_experimental &&
+       !agx_params_driver_supported(&dev->params)) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
                  "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "
