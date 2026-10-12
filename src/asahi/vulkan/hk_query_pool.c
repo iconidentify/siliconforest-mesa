@@ -647,12 +647,8 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(hk_buffer, dst_buffer, dstBuffer);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   /* Occlusion results are written by the graphics batch. A CDM cache flush
-    * does not wait for that batch. Close it before the copy, for every query
-    * type, not only timestamps. */
-   hk_cmd_buffer_end_graphics(cmd);
-   hk_cmd_buffer_end_compute(cmd);
    hk_flush_if_timestamp(cmd, pool);
+
    perf_debug(cmd, "Query pool copy");
 
    struct libagx_copy_query_args info = {
