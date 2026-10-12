@@ -85,6 +85,20 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 void
 hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
+   /* Dependency-tracked mode: a launch is flushed by the next launch of a
+    * later barrier. A compute stream that ends here (a render pass or a
+    * barrier next to graphics closes it) has no next launch in this stream,
+    * so its last launches would reach the following job unflushed. Before
+    * the tracked barrier every launch carried its own flush. Land one at the
+    * trailing edge. The flag stays set, so the next launch flushes too: a
+    * spare flush is cheap, a missing one corrupts.
+    */
+   if (cs->type == HK_CS_CDM && cmd->state.cs.cdm_barrier_pending &&
+       cs->stats.cmds && !cs->cdm_flush_pending) {
+      hk_ensure_cs_has_space(cmd, cs, 0x2000);
+      hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+   }
+
    if (cs->type == HK_CS_CDM && cs->cdm_flush_pending) {
       hk_ensure_cs_has_space(cmd, cs, 0x2000);
       cs->current = agx_cdm_barrier_deferred(cs->current,
