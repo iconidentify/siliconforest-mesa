@@ -103,7 +103,9 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
 
-   if (HK_PERF(dev, ALWAYSCDMBARRIER)) {
+   /* DIAGNOSTIC V2: every launch flushes, but the barrier path is unchanged (a
+    * compute batch can stay open across a barrier). */
+   if (true || HK_PERF(dev, ALWAYSCDMBARRIER)) {
       cs->current =
          agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
       hk_cdm_cache_flush(dev, cs);
