@@ -617,11 +617,25 @@ hk_pool_usc_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 
+static void hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
 {
    if ((*ptr) == NULL) {
+      /* Control streams run in list order, each ordered after every stream
+       * listed before it. A general compute stream left open while a graphics,
+       * pre-graphics or post-graphics stream is appended after it would run
+       * before that stream, and later compute launches that join it would too
+       * (query copies, query zeroing, clears). Close it first so the next
+       * compute launch opens a new tail stream. Compute-only command buffers
+       * never create these streams and keep the dependency-tracked barrier. */
+      bool before_gfx = (ptr == &cmd->current_cs.pre_gfx);
+      if (ptr != &cmd->current_cs.cs && cmd->current_cs.cs &&
+          !(before_gfx && cmd->current_cs.gfx))
+         hk_cmd_buffer_end_compute(cmd);
+
       /* Allocate root control stream */
       size_t initial_size = 65536;
       struct agx_ptr root = hk_pool_alloc(cmd, initial_size, 1024);
@@ -641,8 +655,6 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       };
 
       list_inithead(&cs->node);
-
-      bool before_gfx = (ptr == &cmd->current_cs.pre_gfx);
 
       /* Insert into the command buffer. We usually append to the end of the
        * command buffer, except for pre-graphics streams which go right before
