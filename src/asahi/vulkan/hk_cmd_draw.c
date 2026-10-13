@@ -3928,7 +3928,11 @@ hk_begin_end_xfb(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
       }
    }
 
-   for (unsigned i = 0; i < counterBufferCount; ++i) {
+   /* pCounterBuffers may be NULL, even with a non-zero count. It then names no
+    * counter buffer: Begin starts every buffer at offset zero and End writes
+    * nothing.
+    */
+   for (unsigned i = 0; pCounterBuffers && i < counterBufferCount; ++i) {
       if (pCounterBuffers[i] == VK_NULL_HANDLE)
          continue;
 
