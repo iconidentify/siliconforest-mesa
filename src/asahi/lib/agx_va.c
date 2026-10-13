@@ -4,6 +4,9 @@
  */
 
 #include "agx_bo.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "agx_device.h"
 
 static struct util_vma_heap *
@@ -37,6 +40,11 @@ agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
    }
    simple_mtx_unlock(&dev->vma_lock);
 
+   if (getenv("AGX_VA_TRACE"))
+      fprintf(stderr,
+              "VA alloc dev=%p flags=%d size=0x%" PRIx64 " align=0x%" PRIx64 " fixed=0x%" PRIx64 " -> 0x%" PRIx64 "\n",
+              (void *)dev, (int)flags, size_B, align_B, fixed_va, addr);
+
    if (addr == 0)
       return NULL;
 
@@ -63,6 +71,9 @@ agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind)
 
    simple_mtx_lock(&dev->vma_lock);
    util_vma_heap_free(heap, va->addr, va->size_B);
+   if (getenv("AGX_VA_TRACE"))
+      fprintf(stderr, "VA free dev=%p flags=%d size=0x%" PRIx64 " addr=0x%" PRIx64 "\n", (void *)dev, (int)va->flags,
+              va->size_B, va->addr);
    simple_mtx_unlock(&dev->vma_lock);
    free(va);
 }

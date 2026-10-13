@@ -650,6 +650,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    simple_mtx_init(&dev->vma_lock, mtx_plain);
    util_vma_heap_init(&dev->main_heap, user_start, user_size);
+   if (getenv("AGX_VA_TRACE"))
+      fprintf(stderr, "VA heap dev=%p main=0x%llx+0x%llx usc=0x%llx+0x%llx\n", (void *)dev, (unsigned long long)user_start,
+              (unsigned long long)user_size, (unsigned long long)dev->shader_base, (unsigned long long)shader_size);
    util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
 
    dev->vm_id = vm_create.vm_id;
