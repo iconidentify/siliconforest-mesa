@@ -118,13 +118,15 @@ static const uint8_t sample_loop_footer[] = {
 #define AGX3_CONTAINER_CONST_PROG  0x40u
 
 /* "0f 00 54 <opcode> 00 x6 06 00 06 00 06 00" per record, then two terminals. */
+static const uint8_t agx3_helper_terminal[16] = {
+   0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
+   0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+};
+
 static void
 agx3_fill_helper_table(uint8_t *image, size_t base, unsigned positions)
 {
-   static const uint8_t terminal[16] = {
-      0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
-      0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
-   };
+   const uint8_t *terminal = agx3_helper_terminal;
 
    for (unsigned i = 0; i < positions; ++i) {
       uint8_t *record = image + base + i * 0x10;
@@ -138,8 +140,8 @@ agx3_fill_helper_table(uint8_t *image, size_t base, unsigned positions)
          record[h + 1] = 0x00;
       }
    }
-   memcpy(image + base + positions * 16, terminal, sizeof(terminal));
-   memcpy(image + base + (positions + 1) * 16, terminal, sizeof(terminal));
+   memcpy(image + base + positions * 16, terminal, 16);
+   memcpy(image + base + (positions + 1) * 16, terminal, 16);
 }
 
 static void
@@ -179,6 +181,17 @@ agx3_build_container_lead_for_chip(uint8_t *image, enum agx_chip chip)
    }
    agx3_fill_helper_table(image, 0x100, positions);
    agx3_fill_helper_table(image, 0x200, positions);
+}
+
+/* Put a helper terminal (a return) at every 16-byte slot in [from, to), so a
+ * helper call that lands on one of them returns instead of executing
+ * whatever the page happens to hold there.
+ */
+void
+agx3_fill_helper_terminals(uint8_t *image, size_t from, size_t to)
+{
+   for (size_t offset = from; offset + 16 <= to; offset += 16)
+      memcpy(image + offset, agx3_helper_terminal, 16);
 }
 
 void

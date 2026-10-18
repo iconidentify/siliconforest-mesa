@@ -1488,6 +1488,19 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
       memset(map, 0, usc_base_size);
       agx3_build_container_lead_for_chip(map, dev->chip);
+
+      /* On G15C the profile prefix's computed helper call can index past the
+       * two ten-entry helper tables for some shader cores (compare the
+       * ten-slot tables on G15S). Those calls would run on into the page
+       * after the base page, which is unmapped. Give every later slot a
+       * return so they stay inside this page. The dword at +0x340 is the
+       * zero block size that ends the page's container chain; leave it
+       * alone.
+       */
+      if (dev->chip == AGX_CHIP_G15C) {
+         agx3_fill_helper_terminals(map, 0x2c0, 0x340);
+         agx3_fill_helper_terminals(map, 0x350, usc_base_size);
+      }
       if (agx_bo_sync_for_device(usc_base, 0, usc_base_size))
          return false;
 

@@ -69,6 +69,7 @@ struct agx_linked_shader {
 #define AGX3_CONTAINER_LEAD_SIZE 0x340u
 void agx3_build_container_lead(uint8_t *image);
 void agx3_build_container_lead_for_chip(uint8_t *image, enum agx_chip chip);
+void agx3_fill_helper_terminals(uint8_t *image, size_t from, size_t to);
 
 enum agx_link_result {
    AGX_LINK_SUCCESS,
